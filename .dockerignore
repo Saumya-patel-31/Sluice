@@ -1,0 +1,40 @@
+# Keep the build context small and free of anything that would invalidate the
+# layer cache on every commit. The build needs the Go source, the embedded web
+# assets and the default policy document — nothing else.
+
+.git
+.github
+.gitignore
+.gitattributes
+.claude
+
+# Documentation and deploy manifests are not inputs to the binary.
+docs
+deploy
+README.md
+LICENSE
+
+# Local build output and test artefacts.
+bin
+dist
+*.exe
+*.test
+*.out
+coverage.*
+*.prof
+*.pprof
+
+# Credentials and local overrides must never enter a build context — anything
+# here ends up readable in the image's history.
+certs
+*.pem
+*.key
+*.crt
+configs/local.jsonc
+configs/*.local.*
+
+# Editors and OS noise.
+.idea
+.vscode
+.DS_Store
+Thumbs.db

@@ -4,16 +4,46 @@
 #   docker compose -f deploy/docker-compose.yml up --build
 #
 #   dashboard   http://localhost:8080
-#   through it  curl -H 'x-forwarded-client-cert: By=spiffe://prod.internal/ns/mesh/sa/gw;URI=spiffe://prod.internal/ns/web/sa/feed' \
-#                    http://localhost:10000/api/v1/feed -D-
 #   metrics     http://localhost:8080/metrics
+#   envoy admin http://localhost:9901
 #
-# The curl above is what a mesh sidecar would send. Without that header the
-# request is anonymous, and the baseline policy refuses it — which is the point.
+# Traffic goes through Envoy over mutual TLS, because the identity Sluice
+# authorises on has to come from somewhere a caller cannot forge:
+#
+#   curl --cacert certs/ca.crt --cert certs/feed.crt --key certs/feed.key \
+#        https://localhost:10000/api/v1/feed -D-
+#
+# Envoy verifies that certificate, generates the x-forwarded-client-cert header
+# from its URI SAN, and Sluice reads the SPIFFE ID out of it. A caller cannot
+# set that header itself — Envoy's forward_client_cert_details defaults to
+# SANITIZE and strips inbound copies, which is why a plain HTTP request is
+# anonymous and the baseline policy refuses it.
+#
+# The `certs` service below generates a local CA and workload certificates into
+# a shared volume on first run, so this is still a single command.
 
 name: sluice
 
 services:
+  # ── Local PKI ──────────────────────────────────────────────────────────────
+  # Runs to completion before anything that needs certificates starts.
+  certs:
+    image: alpine:3.21
+    volumes:
+      - certs:/out
+      - ../scripts/gen-certs.sh:/gen-certs.sh:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        if [ -f /out/ca.crt ]; then echo "certificates already present"; exit 0; fi
+        apk add --no-cache openssl >/dev/null
+        sh /gen-certs.sh /out
+        # Envoy runs as a non-root user and has to read the server key.
+        chmod 644 /out/*.key
+    restart: "no"
+
   # ── Control plane ──────────────────────────────────────────────────────────
   sluiced:
     build:
@@ -58,11 +88,13 @@ services:
     command: ["-c", "/etc/envoy/envoy.yaml", "--service-cluster", "sluice-edge"]
     volumes:
       - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+      - certs:/etc/sluice/certs:ro
     ports:
-      - "10000:10000"  # proxied traffic
+      - "10000:10000"  # proxied traffic, mutual TLS
       - "9901:9901"    # Envoy admin
     depends_on:
       sluiced: { condition: service_healthy }
+      certs: { condition: service_completed_successfully }
     restart: unless-stopped
 
   # ── Synthetic regions ──────────────────────────────────────────────────────
@@ -130,22 +162,40 @@ services:
     image: alpine:3.21
     depends_on:
       envoy: { condition: service_started }
+      certs: { condition: service_completed_successfully }
+    volumes:
+      - certs:/certs:ro
     command:
       - /bin/sh
       - -c
       - |
         apk add --no-cache curl >/dev/null
-        XFCC='By=spiffe://prod.internal/ns/mesh/sa/gateway;Hash=demo;URI=spiffe://prod.internal/ns/web/sa/feed'
-        ETL='By=spiffe://prod.internal/ns/mesh/sa/gateway;Hash=demo;URI=spiffe://prod.internal/ns/data/sa/etl'
+        CA="--cacert /certs/ca.crt"
+        FEED="$$CA --cert /certs/feed.crt --key /certs/feed.key"
+        ETL="$$CA --cert /certs/etl.crt --key /certs/etl.key"
+        CHECKOUT="$$CA --cert /certs/checkout.crt --key /certs/checkout.key"
         while true; do
-          for i in 1 2 3 4 5 6; do
-            curl -s -o /dev/null -H "x-forwarded-client-cert: $$XFCC" \
-              -H 'x-sluice-bytes: 8192' http://envoy:10000/api/v1/feed &
+          # Interactive reads: a web workload, latency-weighted route.
+          for i in 1 2 3 4 5; do
+            curl -s -o /dev/null $$FEED -H 'x-sluice-bytes: 8192' \
+              https://envoy:10000/api/v1/feed &
           done
-          curl -s -o /dev/null -H "x-forwarded-client-cert: $$ETL" \
-            -H 'x-sluice-bytes: 262144' http://envoy:10000/batch/reindex &
-          # An unauthenticated probe, which the baseline policy must refuse.
-          curl -s -o /dev/null http://envoy:10000/api/v1/feed &
+          # Batch: trades latency for cheaper, cleaner egress.
+          curl -s -o /dev/null $$ETL -H 'x-sluice-bytes: 262144' \
+            https://envoy:10000/batch/reindex &
+          # Payments: requires mTLS, weighted for reliability.
+          curl -s -o /dev/null $$CHECKOUT -H 'x-sluice-bytes: 2048' \
+            https://envoy:10000/api/payments/charge &
+          # An identity from an untrusted domain — chains to the same CA, so
+          # this proves the trust-domain check does real work.
+          curl -s -o /dev/null $$CA --cert /certs/intruder.crt --key /certs/intruder.key \
+            https://envoy:10000/api/v1/feed &
           sleep 0.4
         done
     restart: unless-stopped
+
+volumes:
+  # Local CA and workload certificates, generated on first run by the `certs`
+  # service. `docker compose down -v` discards them and the next run makes a
+  # fresh set.
+  certs:

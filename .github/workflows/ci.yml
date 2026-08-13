@@ -148,6 +148,97 @@ jobs:
 
       - name: Lint and render
         run: |
-          helm lint deploy/helm/sluice
-          helm template sluice deploy/helm/sluice > /dev/null
-          helm template sluice deploy/helm/sluice --set serviceMonitor.enabled=true > /dev/null
+          helm lint deploy/helm/sluice --set api.token=lint-only
+          helm template sluice deploy/helm/sluice --set api.token=lint-only > /dev/null
+          helm template sluice deploy/helm/sluice --set api.token=lint-only \
+            --set serviceMonitor.enabled=true > /dev/null
+
+      # The chart must refuse to render an unauthenticated write API, the same
+      # way the binary refuses to start with one.
+      - name: The chart rejects a missing API token
+        run: |
+          if helm template sluice deploy/helm/sluice >/dev/null 2>&1; then
+            echo "chart rendered without an API token — the guard is broken"
+            exit 1
+          fi
+          echo "chart correctly refuses to render without a token"
+
+  envoy:
+    name: envoy config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A bootstrap that fails to load takes the entire data plane with it, and
+      # the failure modes are subtle: a YAML merge key Envoy does not implement
+      # rejects the whole file, and a missing route-cache invalidation makes
+      # every request 503 while ext_authz reports success. Both shipped once.
+      # This is the cheapest possible guard against the first.
+      - name: Validate the bootstrap
+        run: |
+          mkdir -p /tmp/certs
+          # Validation loads the referenced certificate paths, so give it
+          # throwaway ones.
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout /tmp/certs/server.key -out /tmp/certs/server.crt \
+            -subj "/CN=validate" 2>/dev/null
+          cp /tmp/certs/server.crt /tmp/certs/ca.crt
+
+          docker run --rm \
+            -v "$PWD/deploy/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro" \
+            -v "/tmp/certs:/etc/sluice/certs:ro" \
+            envoyproxy/envoy:v1.32-latest \
+            --mode validate -c /etc/envoy/envoy.yaml
+
+  stack:
+    name: end-to-end stack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The integration this project exists to demonstrate. It has broken twice
+      # in ways every unit test passed through, so it is exercised for real:
+      # mutual TLS, a live Envoy, three upstreams on separate hosts.
+      - name: Bring up the stack
+        run: |
+          docker compose -f deploy/docker-compose.yml up --build -d
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:8080/readyz >/dev/null && break || sleep 2
+          done
+          docker compose -f deploy/docker-compose.yml ps
+
+      - name: Authorised traffic reaches an upstream
+        run: |
+          docker run --rm --network sluice_default -v sluice_certs:/certs:ro \
+            curlimages/curl:latest -sf \
+            --cacert /certs/ca.crt --cert /certs/feed.crt --key /certs/feed.key \
+            https://envoy:10000/api/v1/feed -o /dev/null
+
+      - name: An untrusted identity is refused
+        run: |
+          code=$(docker run --rm --network sluice_default -v sluice_certs:/certs:ro \
+            curlimages/curl:latest -s -o /dev/null -w '%{http_code}' \
+            --cacert /certs/ca.crt --cert /certs/intruder.crt --key /certs/intruder.key \
+            https://envoy:10000/api/v1/feed)
+          [ "$code" = "403" ] || { echo "expected 403, got $code"; exit 1; }
+
+      - name: Requests actually landed on upstreams
+        run: |
+          total=0
+          for u in aws gcp azure; do
+            n=$(docker compose -f deploy/docker-compose.yml exec -T upstream-$u \
+              wget -qO- http://127.0.0.1:8080/stats | grep -o '"served":[0-9]*' | cut -d: -f2)
+            echo "upstream-$u served $n"
+            total=$((total + n))
+          done
+          # Zero here is the exact symptom of the route-cache bug: everything
+          # looks healthy and no traffic ever arrives.
+          [ "$total" -gt 0 ] || { echo "no upstream served any request"; exit 1; }
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose -f deploy/docker-compose.yml logs --tail=100
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml down -v

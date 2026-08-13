@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +23,26 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "streaming is not supported by this server")
 		return
 	}
+
+	// Reads are unauthenticated, so this is a resource-exhaustion path that
+	// needs no credentials: every subscriber holds a goroutine and a buffered
+	// channel until its connection closes. Refusing past the ceiling keeps a
+	// runaway client from starving the control loop of memory, and 503 with
+	// Retry-After tells a well-behaved one what to do about it.
+	if n := s.streams.Add(1); n > s.maxStreams {
+		s.streams.Add(-1)
+		s.log.Warn("event stream refused: subscriber limit reached",
+			"limit", s.maxStreams, "peer", peerIP(r), "requestId", RequestID(r.Context()))
+		w.Header().Set("Retry-After", "5")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "too_many_streams",
+			"detail": "this control plane is already serving its maximum of " +
+				strconv.FormatInt(s.maxStreams, 10) + " event streams",
+			"limit": s.maxStreams,
+		})
+		return
+	}
+	defer s.streams.Add(-1)
 
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")

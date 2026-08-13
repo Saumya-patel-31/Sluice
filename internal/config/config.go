@@ -63,6 +63,11 @@ type APIConfig struct {
 	// a routable address. It exists so the unsafe configuration has to be
 	// spelled out rather than reached by forgetting something.
 	AllowAnonymousMutations bool `json:"allowAnonymousMutations"`
+	// MaxEventStreams caps concurrent dashboard subscribers. Each holds a
+	// goroutine and a buffered channel for the life of the connection, and
+	// reads need no credential, so an unbounded count is a
+	// resource-exhaustion path open to anyone who can reach the port.
+	MaxEventStreams int `json:"maxEventStreams"`
 }
 
 // PolicyConfig points at the policy document.
@@ -284,6 +289,9 @@ func (c *Config) Normalize() error {
 	}
 	if c.Policy.CacheSize <= 0 {
 		c.Policy.CacheSize = 8192
+	}
+	if c.API.MaxEventStreams <= 0 {
+		c.API.MaxEventStreams = 64
 	}
 	if c.Probe.Path == "" {
 		c.Probe.Path = "/healthz"

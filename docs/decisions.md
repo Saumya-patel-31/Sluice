@@ -26,9 +26,27 @@ costs 10–30µs and the loopback call dominates that; for a mesh where Envoy an
 co-located it is acceptable. A latency-critical deployment would want the gRPC variant
 with connection reuse, which is a drop-in replacement for the same engine.
 
-**Load-bearing detail:** Envoy clears its route cache when `ext_authz` appends upstream
-headers. Without that the header would arrive upstream but the route would already have
-been chosen, and the whole scheme silently does nothing.
+**Load-bearing detail, corrected after actually running it.** The original version of this
+entry claimed Envoy clears its route cache when `ext_authz` appends upstream headers. It
+does not, and the failure is silent in the worst way: `ext_authz` reports success, the
+access log shows `x-sluice-backend` populated with the right value, and every request
+returns 503 with the `NC` (no cluster) flag while `upstream_rq_total` stays at zero.
+
+Envoy resolves the route once, before the filter chain runs, so at that point the header
+does not exist. The working configuration needs three things together:
+
+1. `cluster_header: x-sluice-backend` on a single catch-all route, which is Envoy's
+   purpose-built mechanism for an external service choosing the upstream.
+2. A filter after `ext_authz` that modifies a request header, which invalidates the
+   cached route.
+3. `allowed_upstream_headers` on the authz response, without which the header never
+   reaches the request at all.
+
+One route per backend matching on the header does *not* work — it falls through to the
+catch-all for the same reason.
+
+This is written down at length because it cost most of a debugging session, and because
+every part of it looks correct in isolation.
 
 ---
 

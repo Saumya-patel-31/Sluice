@@ -181,9 +181,16 @@ data can influence the answer while always leaving a warmed estimator to read fr
 
 Two implementations, one decision engine.
 
-**Envoy** (intended for production) calls the `ext_authz` HTTP service. Sluice answers 200
-with `x-sluice-backend: <id>`; Envoy appends the header, clears its route cache, and
-re-matches against a header-keyed route table. No custom filter, no WASM, no xDS server.
+**Envoy** (intended for production) terminates mutual TLS, derives the caller's SPIFFE ID
+from the certificate it verified, and calls the `ext_authz` HTTP service. Sluice answers
+200 with `x-sluice-backend: <cluster>`; a filter invalidates the cached route, and the
+router resolves the cluster from that header via `cluster_header`. No custom filter to
+build, no WASM, no xDS server.
+
+The route invalidation is required and non-obvious — Envoy resolves the route before the
+filter chain runs, so without it every request fails with the `NC` flag while ext_authz
+reports success. [`decisions.md`](decisions.md) records what was tried and what the
+symptoms looked like.
 
 The HTTP variant of `ext_authz` is used rather than gRPC specifically to avoid a protobuf
 toolchain and generated code in the authorisation path.

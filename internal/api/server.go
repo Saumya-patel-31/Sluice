@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/saumyapatel/sluice/internal/app"
@@ -23,14 +24,26 @@ type Server struct {
 	log  *slog.Logger
 	mux  *http.ServeMux
 	auth *Authenticator
+
+	// streams bounds concurrent event-stream subscribers. Each one holds a
+	// goroutine and a buffered channel for the lifetime of the connection, so
+	// an unbounded count is a resource-exhaustion path that needs no
+	// credentials — reads are open.
+	streams    atomic.Int64
+	maxStreams int64
 }
 
 // New builds the HTTP surface.
 func New(a *app.App) *Server {
+	maxStreams := int64(a.Cfg.API.MaxEventStreams)
+	if maxStreams <= 0 {
+		maxStreams = 64
+	}
 	s := &Server{
-		app: a,
-		log: a.Log,
-		mux: http.NewServeMux(),
+		app:        a,
+		log:        a.Log,
+		mux:        http.NewServeMux(),
+		maxStreams: maxStreams,
 		auth: NewAuthenticator(
 			a.Cfg.API.Token,
 			a.Cfg.API.RequireAuthForReads,
@@ -46,8 +59,17 @@ func New(a *app.App) *Server {
 func (s *Server) Auth() *Authenticator { return s.auth }
 
 // Handler returns the root handler with common middleware applied.
+//
+// Order is deliberate, outermost first: the correlation id has to exist before
+// anything can log it, panic recovery has to be outside the access log so a
+// panicking handler still produces one line rather than none, and the security
+// headers sit innermost so they are set on every response including the ones
+// the middleware itself writes.
 func (s *Server) Handler() http.Handler {
-	return securityHeaders(s.mux)
+	return withRequestID(
+		recoverPanics(s.log,
+			accessLog(s.log,
+				securityHeaders(s.mux))))
 }
 
 func (s *Server) routes() {

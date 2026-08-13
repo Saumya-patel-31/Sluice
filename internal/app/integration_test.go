@@ -703,6 +703,85 @@ func TestNativeProxyEndToEnd(t *testing.T) {
 	})
 }
 
+// Reads need no credential, so an unbounded subscriber count is a
+// resource-exhaustion path open to anyone who can reach the port: each stream
+// holds a goroutine and a buffered channel until its connection closes.
+func TestSSESubscriberLimit(t *testing.T) {
+	cfg := config.Default()
+	cfg.Demo.Enabled = false
+	cfg.Listen.API = ""
+	cfg.Listen.Authz = ""
+	cfg.API.Token = testToken
+	cfg.API.MaxEventStreams = 2
+	cfg.Router.ControlIntervalMs = 50
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+
+	a, err := app.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), "test")
+	if err != nil {
+		t.Fatalf("app.New: %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a.Start(ctx)
+
+	srv := httptest.NewServer(api.New(a).Handler())
+	t.Cleanup(srv.Close)
+
+	open := func() (*http.Response, context.CancelFunc) {
+		rctx, rcancel := context.WithCancel(ctx)
+		req, _ := http.NewRequestWithContext(rctx, http.MethodGet, srv.URL+"/api/stream?points=8", nil)
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			rcancel()
+			t.Fatalf("stream: %v", err)
+		}
+		return resp, rcancel
+	}
+
+	r1, c1 := open()
+	defer func() { c1(); r1.Body.Close() }()
+	r2, c2 := open()
+	defer func() { c2(); r2.Body.Close() }()
+
+	if r1.StatusCode != http.StatusOK || r2.StatusCode != http.StatusOK {
+		t.Fatalf("first two streams = %d, %d; both should be accepted", r1.StatusCode, r2.StatusCode)
+	}
+
+	r3, c3 := open()
+	defer func() { c3(); r3.Body.Close() }()
+	if r3.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("third stream = %d, want 503 at the limit", r3.StatusCode)
+	}
+	if r3.Header.Get("Retry-After") == "" {
+		t.Error("a well-behaved client needs to be told when to come back")
+	}
+
+	// Closing one must free a slot; a leaked counter would wedge the endpoint
+	// permanently after a burst of clients.
+	c1()
+	r1.Body.Close()
+
+	var freed bool
+	for i := 0; i < 50 && !freed; i++ {
+		r4, c4 := open()
+		if r4.StatusCode == http.StatusOK {
+			freed = true
+		}
+		c4()
+		r4.Body.Close()
+		if !freed {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if !freed {
+		t.Error("a closed stream did not release its slot")
+	}
+}
+
 func TestSSEStreamDelivers(t *testing.T) {
 	a, h := newStack(t)
 

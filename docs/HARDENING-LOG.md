@@ -9,6 +9,240 @@ finding that comes back.
 
 ---
 
+## Pass 2 — actually deploying it
+
+**Date:** 2026-08-13
+**Posture before:** the container image had never been built, and the Envoy
+integration — the project's headline claim — had never once been run.
+
+Everything in this pass was found by *running* the thing rather than reading
+it. Both of the serious findings were in code that looked correct.
+
+### SLU-101 · The shipped Envoy config could not load
+
+**Severity: critical.** The data plane never started.
+
+The upstream clusters were written with a YAML anchor and merge key
+(`- <<: *region`) to avoid repeating outlier-detection settings three times.
+Envoy parses YAML into protobuf strictly and does not implement YAML 1.1 merge
+keys, so it rejected the **entire bootstrap**:
+
+```
+error initializing config '/etc/envoy/envoy.yaml':
+  ... @ static_resources.clusters[2]: no such field: '<<'
+```
+
+A config that fails to load takes the whole data plane with it, so this would
+have been a total outage in any real deployment.
+
+**Fixed:** the three clusters are written out in full. The repetition is
+deliberate and the comment says why, so nobody tidies it back into an anchor.
+
+**Verified:** `envoy --mode validate -c deploy/envoy/envoy.yaml` reports OK.
+That command is now the cheapest possible guard and belongs in CI.
+
+### SLU-102 · The compose demo's identity path could never have worked
+
+**Severity: high (design error).** With Envoy finally starting, an
+*authenticated* request was still refused as `unauthenticated request rejected`,
+and all three upstreams reported `served: 0`. Nothing had ever reached a
+backend.
+
+The cause is a security default I should have known: **Envoy's
+`forward_client_cert_details` defaults to `SANITIZE`, which strips any
+client-supplied `x-forwarded-client-cert` header.** That behaviour is
+completely correct — otherwise any caller could assert whatever SPIFFE ID it
+liked by setting a header — and it means the demo's premise was wrong. It sent
+XFCC as an ordinary header over plain HTTP, and Envoy quite properly threw it
+away.
+
+**Fixed** by making the demo do what a real mesh does, rather than working
+around the protection:
+
+- The Envoy listener now terminates **real mutual TLS**, with
+  `require_client_certificate: true` and a `validation_context` pointing at a
+  local CA.
+- `forward_client_cert_details: SANITIZE_SET` with
+  `set_current_client_cert_details.uri: true` makes Envoy *generate* the XFCC
+  header from the certificate it verified. The header Sluice reads can now only
+  have come from a cert that chained to the CA.
+- `SANITIZE_SET` rather than `APPEND_FORWARD`: appending would let a caller
+  prepend a forged element, and while Sluice reads the last one, an operator
+  reading the header would see both.
+- `scripts/gen-certs.sh` produces the CA and SPIFFE workload certificates —
+  including one deliberately issued for a **different trust domain but signed
+  by the same CA**, which proves the trust-domain check does real work rather
+  than just re-checking the chain.
+- A `certs` init service generates them into a shared volume on first run, so
+  the stack is still one command.
+- The load generator now uses real client certificates for four distinct
+  workload identities.
+
+This turned the weakest part of the demo into the part that best demonstrates
+the product: identity comes from cryptography, not from a header anyone can set.
+
+### SLU-107 · The documented ext_authz routing mechanism did not work
+
+**Severity: critical.** The project's headline integration. The README, the
+architecture doc and the ADR all described this mechanism, and all three were
+wrong.
+
+With Envoy loading and mTLS working, authorised requests still returned 503 and
+every upstream reported `served: 0`. The diagnostics said everything was fine:
+
+```
+http.sluice_edge.ext_authz.ok:  1601      # authorisation succeeding
+cluster.aws-us-east-1.upstream_rq_total: 0   # nothing forwarded
+{"backend":"aws-us-east-1","flags":"NC","status":503}
+```
+
+Envoy *was* receiving the routing header — the access log shows it, with
+exactly the distribution Sluice computed (429 / 351 / 169 across three
+regions). It simply never routed on it.
+
+**Cause:** Envoy resolves the route once, **before the filter chain runs**. At
+that point the header `ext_authz` is about to set does not exist. The claim in
+the original docs — that Envoy clears its route cache when ext_authz appends
+upstream headers — is not true.
+
+Two configurations were tried and rejected empirically:
+
+| Attempt | Result |
+|---|---|
+| One route per backend matching `x-sluice-backend` | falls through to the catch-all |
+| `cluster_header: x-sluice-backend` alone | `NC` — no cluster |
+
+**Fixed** with three things that only work together:
+
+1. A single catch-all route with `cluster_header: x-sluice-backend`, which is
+   Envoy's purpose-built mechanism for an external service picking the upstream.
+2. `allowed_upstream_headers` on the authz response, without which the header
+   never reaches the request.
+3. **A Lua filter after ext_authz that modifies a request header**, which
+   invalidates the cached route so the router resolves `cluster_header` against
+   what ext_authz just set.
+
+This shape is also the one that scales: adding a region means adding a cluster
+and nothing else.
+
+**Verified** through the live stack — 1,311 requests served across three
+upstreams, and the routing actually reflecting policy:
+
+| Route | Objectives | Distribution |
+|---|---|---|
+| interactive | 60ms SLO, latency 55% | 40 us-central1 · 19 us-east-1 · 1 france |
+| batch | no SLO, cost 45% + carbon 40% | **55 francecentral** · 4 us-east-1 · 1 us-central1 |
+| payments | reliability 50%, mTLS | 21 us-central1 · 9 us-east-1 · 0 france |
+
+Batch moved 92% of its traffic to the region with 27% cheaper egress and a grid
+about seven times cleaner, and paid 88ms for it. The interactive SLO kept that
+same region out. That is the product working.
+
+**Documentation corrected** in `README.md`, `docs/ARCHITECTURE.md`,
+`docs/decisions.md` and the config's own comments — all four described the
+mechanism that does not work. The ADR entry now records what was tried and what
+the symptoms looked like, because every part of the broken version looks
+correct in isolation.
+
+**Guarded** by two new CI jobs: `envoy` validates the bootstrap loads at all,
+and `stack` brings up the real compose stack and asserts that authorised
+traffic reaches an upstream, an untrusted identity gets 403, and the total
+served count is non-zero — zero being the precise symptom of this bug.
+
+### SLU-108 · The mTLS server certificate omitted the hostname clients use
+
+**Severity: moderate.** `gen-certs.sh` issued the server certificate with
+`DNS:localhost,DNS:sluice` but the compose service is named `envoy`. The mutual
+handshake completed — client certificate sent, verified, accepted — and then
+the connection failed hostname verification.
+
+That is a nasty failure to read: the TLS layer succeeds, the request fails, and
+it looks like an authorisation problem when it is a naming one.
+
+**Fixed:** the SAN list now covers every name a client actually dials
+(`localhost`, `envoy`, `sluiced`, `sluice`, `127.0.0.1`, `::1`) and is
+extensible through `SERVER_SANS` for a real deployment.
+
+### SLU-103 · Envoy trusted every RFC1918 address as "internal"
+
+**Severity: moderate.** Envoy warned that `internal_address_config` was unset,
+and its legacy default trusts all private ranges. On an edge listener that
+means anything arriving from a private network is credited with whatever
+`X-Forwarded-For` it supplied — and Sluice's CIDR policies key off exactly that
+address.
+
+**Fixed:** `internal_address_config.cidr_ranges: []`. Nothing is internal.
+
+### SLU-104 · SSE had no subscriber limit
+
+**Severity: moderate.** Reads need no credential, so anyone who could reach the
+port could open unbounded event streams, each holding a goroutine and a
+512-entry channel for the life of the connection.
+
+**Fixed:** `api.maxEventStreams` (default 64). Past the ceiling the endpoint
+returns 503 with `Retry-After` rather than accepting and degrading.
+
+**Verified:** `TestSSESubscriberLimit` opens up to the limit, asserts the next
+is refused with `Retry-After`, then closes one and asserts a slot is freed —
+because a leaked counter would wedge the endpoint permanently after a burst.
+
+### SLU-105 · No request correlation, access log, or panic recovery
+
+**Severity: moderate.** A component making authorisation decisions had no
+access log at all, and a panic in any handler dropped the connection with an
+unstructured trace on stderr.
+
+**Fixed** in `internal/api/middleware.go`:
+
+- **Correlation IDs** reuse an inbound `X-Request-Id` or the trace-id from a
+  W3C `traceparent` before minting one. A control plane that always mints its
+  own produces logs that cannot be joined to the caller's trace, which is
+  precisely the join needed when a decision looks wrong. Caller input is
+  length-bounded.
+- **Access logging** at a level chosen by outcome: successful reads at debug
+  (a dashboard polls once a second — that is noise at info), 4xx at warn, 5xx
+  at error, and **every mutation at info**, because a policy document that can
+  be replaced needs an audit trail of who replaced it.
+- **Panic recovery** producing a real structured log line and a JSON 500
+  carrying the correlation ID, while re-panicking on `http.ErrAbortHandler` so
+  a deliberate abort is not converted into a 500.
+
+The wrapper preserves `http.Flusher`, which has a test of its own — hiding it
+would silently buffer the event stream and the dashboard would just stop
+updating.
+
+### SLU-106 · `docker build` reported success when the daemon was down
+
+**Severity: low, but it wasted a cycle.** The first image build "succeeded"
+with exit 0 while Docker Desktop was not running. `docker build ... | tail`
+returns *tail's* exit code, so the failure was invisible.
+
+**Fixed** in every place a piped command's status matters: `set -o pipefail`
+and `${PIPESTATUS[0]}`. Worth remembering generally — a CI step that pipes to
+`tee` or `tail` has the same hole.
+
+### Also in this pass
+
+- **`Makefile`** covering the workflows CI runs, so "passes locally" and
+  "passes in the pipeline" mean the same thing — including `make vuln`,
+  `make sbom`, `make certs`, `make image-smoke` and `make compose-up`.
+- **`.dockerignore`**, which keeps `.git`, docs and any local credentials out
+  of the build context. Anything in the context is readable in the image's
+  history.
+- **`docs/RUNBOOK.md`** — a response for every alert that ships, keyed to the
+  rules in `deploy/prometheus/alerts.yaml`. It leads with the fact that
+  ext_authz fails closed, so *control-plane availability is data-plane
+  availability*.
+
+### Verified working, first time
+
+The container image needed no fixes: 49.3 MB, runs as uid 65532, `/readyz`
+reports ready, 259 metric series exported, dashboard serves, `sluicectl` works
+inside the image, and the open-write-API warning appears in the logs exactly as
+designed.
+
+---
+
 ## Pass 1 — deployability and the control-plane attack surface
 
 **Date:** 2026-08-13

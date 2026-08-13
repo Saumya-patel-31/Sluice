@@ -244,21 +244,45 @@ it drops into CI as a gate.
 
 ### With Envoy
 
-The whole integration is one `ext_authz` filter and a header-matched route table — no
-custom filter to build, no WASM to ship, no xDS server to operate. Envoy asks Sluice,
-Sluice answers `200` with `x-sluice-backend: <id>`, Envoy appends the header, clears its
-route cache, and re-matches.
+No custom filter to build, no WASM to ship, no xDS server to operate. Envoy asks Sluice,
+Sluice answers `200` with `x-sluice-backend: <cluster>`, and the router forwards there via
+`cluster_header`.
 
 ```bash
 docker compose -f deploy/docker-compose.yml up --build
 ```
 
-That brings up a real Envoy, three synthetic regions on separate hosts, the control
-plane, and a load generator. Dashboard on `:8080`, proxied traffic on `:10000`, Envoy
-admin on `:9901`.
+That brings up a real Envoy terminating **mutual TLS**, three synthetic regions on
+separate hosts, the control plane, and a load generator driving four distinct workload
+identities. It generates its own local CA on first run. Dashboard on `:8080`, proxied
+traffic on `:10000`, Envoy admin on `:9901`.
+
+Measured through that stack, same fleet, same instant:
+
+| Route | Objectives | Where traffic went |
+|---|---|---|
+| `interactive` | 60ms SLO, latency 55% | 40 us-central1 · 19 us-east-1 · 1 france |
+| `batch` | no SLO, cost 45% + carbon 40% | **55 francecentral** · 4 us-east-1 · 1 us-central1 |
+| `payments` | reliability 50%, mTLS required | 21 us-central1 · 9 us-east-1 · 0 france |
+
+Batch put 92% of its traffic on the region with 27% cheaper egress and a grid roughly
+seven times cleaner, and paid 88ms for it. The interactive SLO kept that same region out.
+
+Two things in that configuration are load-bearing and non-obvious:
+
+- **A filter must invalidate the cached route after ext_authz runs.** Envoy resolves the
+  route *before* the filter chain, so the header ext_authz is about to set does not exist
+  yet. Without that invalidation every request fails with the `NC` flag while ext_authz
+  reports success — see [`deploy/envoy/envoy.yaml`](deploy/envoy/envoy.yaml).
+- **Identity cannot come from a header the caller sets.** Envoy's
+  `forward_client_cert_details` defaults to `SANITIZE` and strips inbound
+  `x-forwarded-client-cert` — correctly, or anyone could assert any SPIFFE ID. The demo
+  therefore terminates real mTLS and lets Envoy *generate* that header from the
+  certificate it verified.
 
 > `failure_mode_allow` is set to `false`. An authorisation service that cannot be reached
-> has not authorised anything.
+> has not authorised anything — which also means control-plane availability *is*
+> data-plane availability. See the [runbook](docs/RUNBOOK.md).
 
 ### On Kubernetes
 
