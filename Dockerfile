@@ -29,9 +29,11 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     go build -trimpath -ldflags "-s -w" \
       -o /out/sluice-upstream ./cmd/sluice-upstream
 
-# Verify the tests pass inside the build, so a broken image cannot be produced
-# from a tree that does not pass its own suite.
-RUN CGO_ENABLED=0 go test ./... > /dev/null
+# Deliberately no `go test` here. The suite starts ten HTTP listeners and
+# depends on timing, which is fine on a workstation and flaky inside a
+# constrained build container — and a test failure at image-build time is
+# discovered later and read less carefully than one in CI. The pipeline runs
+# the suite with the race detector before this image is ever built.
 
 # ── Runtime ──────────────────────────────────────────────────────────────────
 FROM alpine:3.21
@@ -57,4 +59,10 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
   CMD wget -qO- http://127.0.0.1:8080/readyz >/dev/null || exit 1
 
 ENTRYPOINT ["/usr/local/bin/sluiced"]
-CMD ["--demo"]
+
+# A container has to bind every interface to be reachable, which is exactly the
+# configuration that refuses to start without an API token. For the zero-config
+# `docker run sluice` demo we opt in explicitly, and the process logs a standing
+# warning that the write API is open. A real deployment overrides this CMD and
+# sets SLUICE_API_TOKEN.
+CMD ["--demo", "--listen", "0.0.0.0:8080", "--dev-insecure"]

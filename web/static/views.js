@@ -80,6 +80,15 @@ export function renderAlerts(el, ov) {
   if (ov.status?.demoMode) {
     chips.push(`<span class="chip chip--mute">${icon('flask')} simulated fleet</span>`);
   }
+  // An open write API means anyone who can reach this page can rewrite the
+  // policy that authorises the whole fleet. It gets a standing warning, not a
+  // line in a log nobody reads.
+  if (ov.status?.anonymousMutations) {
+    chips.push(`<span class="chip chip--bad">${icon('unlock')} write API is open</span>`);
+  }
+  if ((ov.status?.deniedApiRequests ?? 0) > 0) {
+    chips.push(`<span class="chip chip--warn">${icon('shield')} ${ov.status.deniedApiRequests} API call(s) refused</span>`);
+  }
   if ((k.openBreakers ?? 0) > 0) {
     chips.push(`<span class="chip chip--bad">${icon('alert')} ${k.openBreakers} circuit open</span>`);
   }

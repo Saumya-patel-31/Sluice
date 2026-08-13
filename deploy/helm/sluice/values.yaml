@@ -15,6 +15,29 @@ service:
   httpPort: 8080     # dashboard, REST API, /metrics
   authzPort: 8081    # Envoy ext_authz
 
+# The control-plane API can replace the document that authorises every request
+# in the fleet, so mutating calls require a bearer token. A pod binds every
+# interface, so without one the process refuses to start rather than exposing
+# that endpoint to the cluster network.
+#
+#   kubectl create secret generic sluice-api \
+#     --from-literal=token="$(openssl rand -hex 32)"
+#   helm install sluice ... --set api.existingSecret=sluice-api
+api:
+  # existingSecret holds the token. Strongly preferred over `token` below,
+  # which would put a credential in your values file and your release history.
+  existingSecret: ""
+  secretKey: token
+  # token is a last resort for a throwaway environment.
+  token: ""
+  # requireAuthForReads also gates the read API and /metrics. Prometheus can
+  # send an Authorization header when this is on.
+  requireAuthForReads: false
+  # allowAnonymousMutations opens the write API. There is no good reason to
+  # set this in a cluster; it exists so the unsafe posture has to be spelled
+  # out rather than reached by forgetting the secret.
+  allowAnonymousMutations: false
+
 # Sluice reads no Kubernetes API objects, so its service account needs no
 # permissions and no mounted token.
 serviceAccount:

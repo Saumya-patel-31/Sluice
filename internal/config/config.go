@@ -1,8 +1,11 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -20,6 +23,7 @@ type Config struct {
 	Backends []model.Backend `json:"backends"`
 	Routes   []model.Route   `json:"routes"`
 
+	API     APIConfig     `json:"api"`
 	Policy  PolicyConfig  `json:"policy"`
 	Pricing PricingConfig `json:"pricing"`
 	Carbon  CarbonConfig  `json:"carbon"`
@@ -38,6 +42,27 @@ type ListenConfig struct {
 	Proxy string `json:"proxy"`
 	// Authz serves the Envoy ext_authz HTTP endpoint. Empty disables it.
 	Authz string `json:"authz"`
+}
+
+// APIConfig controls access to the control-plane API.
+//
+// This surface can replace the entire authorisation policy with one request.
+// An unauthenticated write API on a component whose job is zero-trust
+// authorisation is not a rough edge, it is the whole product defeated, so the
+// posture here is fail-at-deploy rather than fail-at-exploit: a configuration
+// that would expose writes to a network refuses to start.
+type APIConfig struct {
+	// Token is required in an Authorization: Bearer header (or X-Sluice-Token)
+	// on every mutating request. Supply it through SLUICE_API_TOKEN or
+	// SLUICE_API_TOKEN_FILE rather than in a committed file.
+	Token string `json:"token,omitempty"`
+	// RequireAuthForReads extends the token requirement to read endpoints.
+	// /healthz and /readyz are always exempt so a kubelet can probe them.
+	RequireAuthForReads bool `json:"requireAuthForReads"`
+	// AllowAnonymousMutations is the explicit escape hatch for a demo bound to
+	// a routable address. It exists so the unsafe configuration has to be
+	// spelled out rather than reached by forgetting something.
+	AllowAnonymousMutations bool `json:"allowAnonymousMutations"`
 }
 
 // PolicyConfig points at the policy document.
@@ -189,7 +214,9 @@ func millisToDuration(v float64, fallback time.Duration) time.Duration {
 // Loading
 // -----------------------------------------------------------------------------
 
-// Load reads a JSONC configuration file and applies defaults.
+// Load reads a JSONC configuration file, overlays the environment, and applies
+// defaults. It does not call Normalize — the caller applies flag overrides
+// first, since flags have the highest precedence.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -204,16 +231,50 @@ func Load(path string) (*Config, error) {
 	if err := dec.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("config: %s: %w", path, err)
 	}
-	if err := cfg.Normalize(); err != nil {
+	if err := cfg.ApplyEnv(os.Getenv); err != nil {
 		return nil, err
 	}
 	return cfg, nil
 }
 
+// LoopbackOnly reports whether a listen address is reachable only from the
+// local host.
+//
+// An empty or wildcard host means every interface, which is what ":8080" and
+// "0.0.0.0:8080" both mean and what a container almost always wants — so those
+// are treated as exposed, not as unknown.
+func LoopbackOnly(addr string) bool {
+	if addr == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.Trim(host, "[]")
+	switch host {
+	case "", "0.0.0.0", "::", "*":
+		return false
+	case "localhost":
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// A hostname we cannot classify. Assume it is routable; guessing
+		// "loopback" here would silently open the write API.
+		return false
+	}
+	return ip.IsLoopback()
+}
+
 // Normalize applies defaults and validates the configuration.
 func (c *Config) Normalize() error {
 	if c.Listen.API == "" {
-		c.Listen.API = ":8080"
+		// Loopback rather than every interface. A control plane that binds
+		// 0.0.0.0 by default is one nmap away from an open policy editor, and
+		// the deployments that genuinely need a routable bind (containers) all
+		// set it explicitly anyway.
+		c.Listen.API = "127.0.0.1:8080"
 	}
 	if c.Ledger.Capacity <= 0 {
 		c.Ledger.Capacity = 2000
@@ -306,14 +367,64 @@ func (c *Config) Normalize() error {
 		return fmt.Errorf("config: no route matches \"/\"; requests outside every prefix would be denied")
 	}
 
-	return nil
+	return c.validateAPIPosture()
 }
 
-// Save writes the configuration as indented JSON.
+// validateAPIPosture refuses to start a configuration that would expose an
+// unauthenticated write API to a network.
+//
+// Refusing at startup rather than returning 403 at request time is deliberate.
+// A 403 is discovered by whoever probes for it; a failed rollout is discovered
+// by the person deploying, while they are still holding the context to fix it.
+func (c *Config) validateAPIPosture() error {
+	if c.API.Token != "" || c.API.AllowAnonymousMutations {
+		return nil
+	}
+	if LoopbackOnly(c.Listen.API) {
+		return nil
+	}
+	return fmt.Errorf(
+		"config: the API is bound to %s, which is reachable from the network, but no api.token is set.\n"+
+			"        Anyone who can reach that address could replace the policy document.\n"+
+			"        Set %sAPI_TOKEN (or %sAPI_TOKEN_FILE), bind the API to loopback,\n"+
+			"        or pass --dev-insecure to accept an unauthenticated write API.",
+		c.Listen.API, EnvPrefix, EnvPrefix)
+}
+
+// MutationsRequireToken reports whether writes will be gated by a token.
+func (c *Config) MutationsRequireToken() bool { return c.API.Token != "" }
+
+// Render writes the effective configuration as indented JSON.
+//
+// Named Render rather than WriteTo so it does not half-implement io.WriterTo,
+// whose signature returns a byte count: a mismatch go vet flags, and one that
+// would silently break anything type-asserting for that interface.
+//
+// The API token is redacted. `--print-config` is the command an operator runs
+// when a deployment is misbehaving, usually into a ticket or a chat window,
+// and a credential that leaks that way leaks permanently.
+func (c *Config) Render(w io.Writer) error {
+	redacted := *c
+	if redacted.API.Token != "" {
+		redacted.API.Token = "<redacted>"
+	}
+	if redacted.Carbon.ElectricityMapsToken != "" {
+		redacted.Carbon.ElectricityMapsToken = "<redacted>"
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	// Without this, angle brackets and ampersands come out as < escapes.
+	// This output is meant to be read and diffed by a person, not embedded in
+	// a page.
+	enc.SetEscapeHTML(false)
+	return enc.Encode(&redacted)
+}
+
+// Save writes the configuration to a file, with secrets redacted.
 func (c *Config) Save(path string) error {
-	b, err := json.MarshalIndent(c, "", "  ")
-	if err != nil {
+	var buf bytes.Buffer
+	if err := c.Render(&buf); err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(b, '\n'), 0o644)
+	return os.WriteFile(path, buf.Bytes(), 0o600)
 }

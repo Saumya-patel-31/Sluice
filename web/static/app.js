@@ -16,6 +16,78 @@ import * as V from './views.js';
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
+/* ── Control-plane credential ──────────────────────────────────────────── */
+
+/*
+ * The token lives in sessionStorage, not localStorage: it is a credential that
+ * can rewrite the fleet's authorisation policy, and it should not survive the
+ * tab that was deliberately opened to use it. Reads never carry it — only
+ * mutations — so a shoulder-surfed dashboard cannot be turned into a write.
+ */
+const TOKEN_KEY = 'sluice.apiToken';
+
+const token = {
+  get: () => sessionStorage.getItem(TOKEN_KEY) || '',
+  set: (v) => { if (v) sessionStorage.setItem(TOKEN_KEY, v); else sessionStorage.removeItem(TOKEN_KEY); },
+  has: () => !!sessionStorage.getItem(TOKEN_KEY),
+};
+
+/** Ask for a token, resolving to true when one was entered. */
+function askForToken() {
+  return new Promise((resolve) => {
+    const dlg = $('#token-dialog');
+    const input = $('#token-input');
+    input.value = token.get();
+
+    const onClose = () => {
+      dlg.removeEventListener('close', onClose);
+      const saved = dlg.returnValue === 'save' && input.value.trim() !== '';
+      if (saved) token.set(input.value.trim());
+      input.value = '';
+      renderTokenButton();
+      resolve(saved);
+    };
+    dlg.addEventListener('close', onClose);
+    dlg.showModal();
+    input.focus();
+  });
+}
+
+/**
+ * Fetch an API endpoint, attaching the token to mutating calls.
+ *
+ * A 401 is treated as "we need a credential" rather than as a failure: the
+ * dialog opens, and the original request is retried once with whatever was
+ * entered. That keeps the dashboard usable against a locked-down control plane
+ * without asking for the token before anyone has tried to change anything.
+ */
+async function apiFetch(path, opts = {}, { retry = true } = {}) {
+  const method = (opts.method || 'GET').toUpperCase();
+  const mutating = !['GET', 'HEAD', 'OPTIONS'].includes(method);
+
+  const headers = { ...(opts.headers || {}) };
+  if (mutating && token.has()) headers['X-Sluice-Token'] = token.get();
+
+  const res = await fetch(path, { ...opts, headers });
+  if (res.status === 401 && retry) {
+    if (await askForToken()) return apiFetch(path, opts, { retry: false });
+  }
+  return res;
+}
+
+function renderTokenButton() {
+  const btn = $('#token-btn');
+  const authed = state.overview?.status?.authEnabled;
+  btn.hidden = !authed;
+  if (!authed) return;
+  const have = token.has();
+  btn.classList.toggle('btn--warn', !have);
+  $('#token-state').textContent = have ? 'token set' : 'token needed';
+  btn.setAttribute('aria-label', have
+    ? 'Replace the control-plane API token'
+    : 'Set the control-plane API token');
+}
+
 /* ── State ─────────────────────────────────────────────────────────────── */
 
 const state = {
@@ -57,6 +129,8 @@ function boot() {
   wirePolicyEditor();
   wireTopologyControls();
   wireConsole();
+
+  $('#token-btn').addEventListener('click', askForToken);
 
   stream = new StreamChart($('#stream-chart'));
   topology = new TopologyView($('#topo-canvas'), $('#topo-tip'));
@@ -128,6 +202,7 @@ function onOverview() {
   hydrateIcons($('#alert-chips'));
 
   $('#console').hidden = !ov.status?.demoMode;
+  renderTokenButton();
 
   if (!state.allocRoute && ov.routes?.length) state.allocRoute = ov.routes[0].route.id;
   if (!state.topoRoute && ov.routes?.length) {
@@ -469,11 +544,16 @@ async function runBacktest() {
   selectTab('backtest');
 
   try {
-    const res = await fetch('/api/policy/backtest?limit=800', {
+    const res = await apiFetch('/api/policy/backtest?limit=800', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ source: $('#policy-source').value }),
     });
+    if (!res.ok && res.status !== 200) {
+      const err = await res.json().catch(() => ({}));
+      setPolicyStatus(err.detail || `backtest refused (${res.status})`, 'bad');
+      return;
+    }
     state.backtest = await res.json();
     V.renderBacktest($('#policy-backtest-panel'), state.backtest);
     hydrateIcons($('#policy-backtest-panel'));
@@ -499,14 +579,19 @@ async function applyPolicy() {
   btn.disabled = true;
   setPolicyStatus('compiling and installing…', 'busy');
   try {
-    const res = await fetch('/api/policy', {
+    const res = await apiFetch('/api/policy', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ source: $('#policy-source').value }),
     });
     const data = await res.json();
     if (!res.ok) {
-      setPolicyStatus(data.line ? `line ${data.line}: ${data.message ?? data.error}` : (data.error ?? 'rejected'), 'bad');
+      // 401/403 come back with a `detail` explaining what to do about it;
+      // a compile failure comes back with a line number.
+      const msg = data.line
+        ? `line ${data.line}: ${data.message ?? data.error}`
+        : (data.detail ?? data.error ?? 'rejected');
+      setPolicyStatus(msg, 'bad');
       return;
     }
     state.policyDirty = false;
@@ -590,7 +675,7 @@ async function injectIncident() {
   const btn = $('#inc-fire');
   btn.disabled = true;
   try {
-    await fetch('/api/incidents', {
+    await apiFetch('/api/incidents', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -609,7 +694,7 @@ async function injectIncident() {
 
 async function resolveIncident(id) {
   try {
-    await fetch(`/api/incidents/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    await apiFetch(`/api/incidents/${encodeURIComponent(id)}`, { method: 'DELETE' });
   } catch (err) {
     console.error('incident resolve failed', err);
   }

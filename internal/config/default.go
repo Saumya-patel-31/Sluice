@@ -22,9 +22,12 @@ import "github.com/saumyapatel/sluice/internal/model"
 func Default() *Config {
 	return &Config{
 		Listen: ListenConfig{
-			API:   ":8080",
+			// Loopback, not every interface. The default posture of a
+			// component that can rewrite authorisation policy should be "not
+			// reachable"; container deployments override this explicitly.
+			API:   "127.0.0.1:8080",
 			Proxy: "",
-			Authz: ":8081",
+			Authz: "127.0.0.1:8081",
 		},
 		Backends: defaultBackends(),
 		Routes:   defaultRoutes(),

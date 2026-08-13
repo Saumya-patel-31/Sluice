@@ -21,6 +21,15 @@ type Status struct {
 	DemoMode      bool      `json:"demoMode"`
 	Backends      int       `json:"backends"`
 	Routes        int       `json:"routes"`
+	// AuthEnabled reports whether a token gates mutating API calls.
+	AuthEnabled bool `json:"authEnabled"`
+	// AnonymousMutations is true when the write API was explicitly opened.
+	// The dashboard shows a standing warning while it is, because an open
+	// policy editor is not a state anyone should reach without noticing.
+	AnonymousMutations bool `json:"anonymousMutations"`
+	// DeniedAPIRequests counts refused control-plane calls, so probing the
+	// admin surface is visible rather than silent.
+	DeniedAPIRequests uint64 `json:"deniedApiRequests"`
 	// PriceTableAsOf dates the bundled list prices, so the UI can say plainly
 	// where a number came from.
 	PriceTableAsOf string `json:"priceTableAsOf"`

@@ -1,0 +1,33 @@
+# Normalise line endings on checkin, and force LF on checkout for everything
+# that a Linux container will execute or parse.
+#
+# Without this, a Windows checkout writes CRLF into shell scripts and YAML,
+# and the resulting image fails with `bad interpreter: /bin/sh^M` — a build
+# that passes on the developer's machine and dies in the registry.
+* text=auto
+
+*.go        text eol=lf
+*.sh        text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.json      text eol=lf
+*.jsonc     text eol=lf
+*.sluice    text eol=lf
+*.md        text eol=lf
+*.tpl       text eol=lf
+*.css       text eol=lf
+*.js        text eol=lf
+*.html      text eol=lf
+*.svg       text eol=lf
+Dockerfile  text eol=lf
+Makefile    text eol=lf
+LICENSE     text eol=lf
+.gitignore  text eol=lf
+.gitattributes text eol=lf
+
+# Keep generated coverage and binaries out of diffs.
+*.out       binary
+*.exe       binary
+
+# Collapse vendored or generated content in review.
+web/static/*.js linguist-vendored=false

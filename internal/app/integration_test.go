@@ -24,6 +24,11 @@ import (
 const meshXFCC = `By=spiffe://prod.internal/ns/mesh/sa/gateway;Hash=test;` +
 	`URI=spiffe://prod.internal/ns/web/sa/feed`
 
+// testToken gates the mutating API here exactly as it would in a real
+// deployment, so these tests exercise the authenticated path rather than an
+// open one.
+const testToken = "integration-test-token"
+
 // newStack brings up a complete control plane against the in-process
 // simulator: real upstream sockets, real probes, real decisions.
 func newStack(t *testing.T) (*app.App, http.Handler) {
@@ -35,6 +40,7 @@ func newStack(t *testing.T) (*app.App, http.Handler) {
 	cfg.Demo.AutoIncidents = false
 	cfg.Listen.API = ""
 	cfg.Listen.Authz = ""
+	cfg.API.Token = testToken
 	cfg.Router.ControlIntervalMs = 50
 	cfg.Probe.IntervalMs = 100
 	if err := cfg.Normalize(); err != nil {
@@ -63,6 +69,17 @@ func newStack(t *testing.T) (*app.App, http.Handler) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return a, api.New(a).Handler()
+}
+
+// authRequest issues a mutating control-plane call with the bearer token the
+// stack was configured with.
+func authRequest(h http.Handler, method, path, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
 }
 
 func getJSON(t *testing.T, h http.Handler, path string, out any) *httptest.ResponseRecorder {
@@ -293,6 +310,126 @@ func TestAPISurface(t *testing.T) {
 	})
 }
 
+// The control-plane API can replace the document that authorises every
+// request in the fleet. These are the tests that keep that surface shut.
+func TestAPIAuthentication(t *testing.T) {
+	_, h := newStack(t)
+
+	openPolicy := `{"source":"policy \"pwn\" { priority 1 effect allow when true }"}`
+
+	send := func(method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	t.Run("an unauthenticated write is refused", func(t *testing.T) {
+		for _, c := range []struct{ method, path, body string }{
+			{http.MethodPut, "/api/policy", openPolicy},
+			{http.MethodPost, "/api/incidents", `{"backendId":"aws-us-east-1","kind":"outage"}`},
+			{http.MethodDelete, "/api/incidents/whatever", ""},
+			{http.MethodPost, "/api/policy/backtest", openPolicy},
+		} {
+			rec := send(c.method, c.path, c.body, nil)
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("%s %s = %d, want 401", c.method, c.path, rec.Code)
+			}
+			if got := rec.Header().Get("WWW-Authenticate"); got == "" {
+				t.Errorf("%s %s: missing WWW-Authenticate", c.method, c.path)
+			}
+		}
+	})
+
+	t.Run("a wrong token is refused", func(t *testing.T) {
+		for _, tok := range []string{"wrong", "", testToken + "x", testToken[:5]} {
+			rec := send(http.MethodPut, "/api/policy", openPolicy,
+				map[string]string{"Authorization": "Bearer " + tok})
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("token %q = %d, want 401", tok, rec.Code)
+			}
+		}
+	})
+
+	t.Run("a rejected write leaves the policy untouched", func(t *testing.T) {
+		var before struct {
+			Hash string `json:"hash"`
+		}
+		getJSON(t, h, "/api/policy", &before)
+
+		send(http.MethodPut, "/api/policy", openPolicy, nil)
+		send(http.MethodPut, "/api/policy", openPolicy, map[string]string{"Authorization": "Bearer nope"})
+
+		var after struct {
+			Hash string `json:"hash"`
+		}
+		getJSON(t, h, "/api/policy", &after)
+		if after.Hash != before.Hash {
+			t.Fatal("a refused request still changed the live policy set")
+		}
+	})
+
+	t.Run("both header forms are accepted", func(t *testing.T) {
+		for _, hdr := range []map[string]string{
+			{"Authorization": "Bearer " + testToken},
+			{"X-Sluice-Token": testToken},
+		} {
+			rec := send(http.MethodPost, "/api/policy/backtest", openPolicy, hdr)
+			if rec.Code != http.StatusOK {
+				t.Errorf("%v = %d, want 200", hdr, rec.Code)
+			}
+		}
+	})
+
+	t.Run("a token in the query string is not accepted", func(t *testing.T) {
+		// It would land in every access log and proxy trace along the path.
+		rec := send(http.MethodPut, "/api/policy?token="+testToken, openPolicy, nil)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("query-string token = %d, want 401", rec.Code)
+		}
+	})
+
+	t.Run("reads stay open and refusals are counted", func(t *testing.T) {
+		if rec := getJSON(t, h, "/api/overview", nil); rec.Code != http.StatusOK {
+			t.Errorf("read = %d, want 200", rec.Code)
+		}
+		var s struct {
+			AuthEnabled bool   `json:"authEnabled"`
+			Denied      uint64 `json:"deniedApiRequests"`
+		}
+		getJSON(t, h, "/api/status", &s)
+		if !s.AuthEnabled {
+			t.Error("status should report that auth is on")
+		}
+		if s.Denied == 0 {
+			t.Error("refusals must be counted so probing the admin surface is visible")
+		}
+	})
+
+	t.Run("probes never require a credential", func(t *testing.T) {
+		for _, p := range []string{"/healthz", "/readyz"} {
+			if rec := getJSON(t, h, p, nil); rec.Code != http.StatusOK {
+				t.Errorf("%s = %d — a probe that needs a secret fails during the "+
+					"incident where the secret source is down", p, rec.Code)
+			}
+		}
+	})
+
+	t.Run("unknown API paths answer as API, not as a page", func(t *testing.T) {
+		rec := getJSON(t, h, "/api/nope", nil)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", rec.Code)
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+			t.Errorf("content type = %q; an API client parses HTML 200 as success", ct)
+		}
+	})
+}
+
 func TestPolicyLifecycle(t *testing.T) {
 	_, h := newStack(t)
 
@@ -307,8 +444,7 @@ func TestPolicyLifecycle(t *testing.T) {
 
 	t.Run("a broken document is rejected with a position", func(t *testing.T) {
 		body := `{"source":"policy \"x\" {\n  effect allow\n  when subject.id ==\n}"}`
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/policy", strings.NewReader(body)))
+		rec := authRequest(h, http.MethodPut, "/api/policy", body)
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("status = %d, want 400", rec.Code)
 		}
@@ -334,9 +470,7 @@ func TestPolicyLifecycle(t *testing.T) {
 			`backend.jurisdiction == "EU"`, `backend.region == "francecentral"`, 1)
 		body, _ := json.Marshal(map[string]string{"source": tightened})
 
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/policy/backtest",
-			strings.NewReader(string(body))))
+		rec := authRequest(h, http.MethodPost, "/api/policy/backtest", string(body))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("backtest = %d", rec.Code)
 		}
@@ -369,8 +503,7 @@ func TestPolicyLifecycle(t *testing.T) {
 	t.Run("a valid document installs", func(t *testing.T) {
 		doc := `policy "allow-all" { priority 1 effect allow when true }`
 		body, _ := json.Marshal(map[string]string{"source": doc})
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/policy", strings.NewReader(string(body))))
+		rec := authRequest(h, http.MethodPut, "/api/policy", string(body))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
 		}

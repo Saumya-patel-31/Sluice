@@ -128,8 +128,10 @@ func TestNormalizeAppliesDefaults(t *testing.T) {
 		t.Fatalf("normalize: %v", err)
 	}
 
-	if cfg.Listen.API != ":8080" {
-		t.Errorf("listen = %q", cfg.Listen.API)
+	// Loopback, not every interface: the default posture of a component that
+	// can rewrite authorisation policy should be "not reachable".
+	if cfg.Listen.API != "127.0.0.1:8080" {
+		t.Errorf("listen = %q, want a loopback default", cfg.Listen.API)
 	}
 	if cfg.Backends[0].Bias != 1 {
 		t.Errorf("bias should default to neutral, got %v", cfg.Backends[0].Bias)
@@ -145,6 +147,172 @@ func TestNormalizeAppliesDefaults(t *testing.T) {
 	}
 	if cfg.Routes[0].Temperature <= 0 {
 		t.Error("temperature should be defaulted")
+	}
+}
+
+// The control-plane API can replace the document that authorises every
+// request in the fleet. A configuration that would expose that to a network
+// without a credential must not be startable by accident.
+func TestAPIPostureFailsClosed(t *testing.T) {
+	exposed := func() *Config {
+		c := Default()
+		c.Listen.API = "0.0.0.0:8080"
+		return c
+	}
+
+	if err := exposed().Normalize(); err == nil {
+		t.Fatal("a network-reachable API with no token must refuse to start")
+	} else if !strings.Contains(err.Error(), "API_TOKEN") {
+		t.Errorf("the error should say how to fix it, got: %v", err)
+	}
+
+	withToken := exposed()
+	withToken.API.Token = "secret"
+	if err := withToken.Normalize(); err != nil {
+		t.Errorf("a token should satisfy the check: %v", err)
+	}
+
+	// The unsafe configuration has to be spelled out, not reached by omission.
+	explicit := exposed()
+	explicit.API.AllowAnonymousMutations = true
+	if err := explicit.Normalize(); err != nil {
+		t.Errorf("an explicit opt-in should be accepted: %v", err)
+	}
+
+	// Loopback needs no token: there is no boundary to cross.
+	for _, addr := range []string{"127.0.0.1:8080", "localhost:8080", "[::1]:8080"} {
+		c := Default()
+		c.Listen.API = addr
+		if err := c.Normalize(); err != nil {
+			t.Errorf("%s should not require a token: %v", addr, err)
+		}
+	}
+}
+
+func TestLoopbackOnly(t *testing.T) {
+	cases := map[string]bool{
+		"127.0.0.1:8080": true,
+		"localhost:8080": true,
+		"[::1]:8080":     true,
+		"127.0.0.1":      true,
+		"0.0.0.0:8080":   false,
+		":8080":          false,
+		"[::]:8080":      false,
+		"10.0.0.5:8080":  false,
+		"":               false,
+		// An unresolvable hostname must read as routable. Guessing "loopback"
+		// here would silently open the write API.
+		"sluice.internal:8080": false,
+	}
+	for addr, want := range cases {
+		if got := LoopbackOnly(addr); got != want {
+			t.Errorf("LoopbackOnly(%q) = %v, want %v", addr, got, want)
+		}
+	}
+}
+
+func TestApplyEnv(t *testing.T) {
+	env := map[string]string{
+		"SLUICE_LISTEN_API":                 "0.0.0.0:9000",
+		"SLUICE_API_TOKEN":                  "from-env",
+		"SLUICE_ELECTRICITY_MAPS_TOKEN":     "grid-token",
+		"SLUICE_PRICING_LIVE":               "true",
+		"SLUICE_CARBON_ENERGY_KWH_PER_GB":   "0.03",
+		"SLUICE_TLS_TRUST_DOMAINS":          "prod.internal, staging.internal",
+		"SLUICE_API_REQUIRE_AUTH_FOR_READS": "1",
+	}
+	cfg := Default()
+	if err := cfg.ApplyEnv(func(k string) string { return env[k] }); err != nil {
+		t.Fatalf("ApplyEnv: %v", err)
+	}
+
+	if cfg.Listen.API != "0.0.0.0:9000" || cfg.API.Token != "from-env" {
+		t.Errorf("listen=%q token=%q", cfg.Listen.API, cfg.API.Token)
+	}
+	if cfg.Carbon.ElectricityMapsToken != "grid-token" {
+		t.Error("the grid token was ignored — the k8s manifest sets this and it must take effect")
+	}
+	if !cfg.Pricing.Live || !cfg.API.RequireAuthForReads {
+		t.Error("boolean overrides not applied")
+	}
+	if cfg.Carbon.EnergyKWhPerGB != 0.03 {
+		t.Errorf("energy intensity = %v", cfg.Carbon.EnergyKWhPerGB)
+	}
+	if len(cfg.TLS.TrustDomains) != 2 || cfg.TLS.TrustDomains[1] != "staging.internal" {
+		t.Errorf("trust domains = %v", cfg.TLS.TrustDomains)
+	}
+
+	// A malformed value must fail loudly rather than silently keeping the
+	// default, which is how a "live pricing" flag quietly stays off.
+	bad := Default()
+	err := bad.ApplyEnv(func(k string) string {
+		if k == "SLUICE_PRICING_LIVE" {
+			return "yes-please"
+		}
+		return ""
+	})
+	if err == nil {
+		t.Error("a malformed boolean should be rejected")
+	}
+}
+
+// Secrets belong in a mounted file rather than the process environment, where
+// /proc/<pid>/environ and every crash dump can read them.
+func TestApplyEnvReadsSecretFiles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "token")
+	if err := os.WriteFile(path, []byte("  file-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Default()
+	err := cfg.ApplyEnv(func(k string) string {
+		switch k {
+		case "SLUICE_API_TOKEN_FILE":
+			return path
+		case "SLUICE_API_TOKEN":
+			return "env-token"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("ApplyEnv: %v", err)
+	}
+	if cfg.API.Token != "file-token" {
+		t.Errorf("the _FILE form should win and be trimmed, got %q", cfg.API.Token)
+	}
+
+	missing := Default()
+	if err := missing.ApplyEnv(func(k string) string {
+		if k == "SLUICE_API_TOKEN_FILE" {
+			return filepath.Join(dir, "absent")
+		}
+		return ""
+	}); err == nil {
+		t.Error("an unreadable secret file must be an error, not an empty token")
+	}
+}
+
+// --print-config is what an operator pastes into a ticket.
+func TestRenderRedactsSecrets(t *testing.T) {
+	cfg := Default()
+	cfg.API.Token = "super-secret"
+	cfg.Carbon.ElectricityMapsToken = "grid-secret"
+
+	var buf strings.Builder
+	if err := cfg.Render(&buf); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "super-secret") || strings.Contains(out, "grid-secret") {
+		t.Fatal("--print-config leaked a credential")
+	}
+	if !strings.Contains(out, "<redacted>") {
+		t.Error("expected the redaction marker so the reader knows a value exists")
+	}
+	// The original must not be mutated by printing it.
+	if cfg.API.Token != "super-secret" {
+		t.Error("Render mutated the live configuration")
 	}
 }
 

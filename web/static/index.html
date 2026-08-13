@@ -54,6 +54,10 @@
 
       <div class="topbar__right">
         <div class="chipgroup" id="alert-chips" aria-live="polite"></div>
+        <button class="btn btn--icon" id="token-btn" type="button" hidden
+                aria-label="Set the control-plane API token">
+          <span data-icon="key"></span><span id="token-state">token</span>
+        </button>
         <div class="conn" id="conn" data-state="connecting">
           <span class="conn__dot" aria-hidden="true"></span>
           <span class="conn__label">connecting</span>
@@ -274,6 +278,30 @@
     </main>
   </div>
 </div>
+
+<!-- Token prompt. Shown only when the control plane refuses a write. -->
+<dialog class="tokendlg" id="token-dialog" aria-labelledby="token-dialog-title">
+  <form method="dialog" id="token-form">
+    <h2 class="tokendlg__title" id="token-dialog-title">Control-plane token</h2>
+    <p class="tokendlg__body">
+      This control plane requires a bearer token for changes that alter routing —
+      editing the policy document or injecting an incident. Reading is unrestricted.
+    </p>
+    <div class="field">
+      <label for="token-input">Token</label>
+      <input id="token-input" type="password" autocomplete="off" spellcheck="false"
+             placeholder="value of SLUICE_API_TOKEN">
+    </div>
+    <p class="tokendlg__note">
+      Held in this tab's session storage only — it is gone when you close the tab,
+      and never written to disk.
+    </p>
+    <div class="tokendlg__actions">
+      <button class="btn" value="cancel" type="submit">Cancel</button>
+      <button class="btn btn--primary" value="save" type="submit" id="token-save">Save</button>
+    </div>
+  </form>
+</dialog>
 
 <!-- Incident console: only rendered when the control plane runs in demo mode -->
 <div class="console" id="console" hidden>

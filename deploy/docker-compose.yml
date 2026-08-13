@@ -24,6 +24,16 @@ services:
     command:
       - --config=/etc/sluice/sluice.jsonc
       - --log-level=info
+    environment:
+      # The control-plane API can replace the document that authorises every
+      # request in the fleet, so mutating calls need this token:
+      #
+      #   curl -X PUT -H "Authorization: Bearer $${SLUICE_API_TOKEN:-compose-demo-token}" ...
+      #
+      # Override it, or better, point SLUICE_API_TOKEN_FILE at a mounted secret.
+      SLUICE_API_TOKEN: ${SLUICE_API_TOKEN:-compose-demo-token}
+      SLUICE_LISTEN_API: 0.0.0.0:8080
+      SLUICE_LISTEN_AUTHZ: 0.0.0.0:8081
     volumes:
       - ../configs/compose.jsonc:/etc/sluice/sluice.jsonc:ro
       - ../configs/policies.sluice:/etc/sluice/policies.sluice:ro

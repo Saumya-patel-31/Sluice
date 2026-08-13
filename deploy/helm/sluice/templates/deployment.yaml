@@ -49,14 +49,41 @@ spec:
           ports:
             - { name: http, containerPort: {{ .Values.service.httpPort }} }
             - { name: authz, containerPort: {{ .Values.service.authzPort }} }
-          {{- with .Values.carbon.electricityMaps.existingSecret }}
           env:
+            # A pod binds every interface; the config file keeps loopback so
+            # the same file works unchanged on a workstation.
+            - name: SLUICE_LISTEN_API
+              value: "0.0.0.0:{{ .Values.service.httpPort }}"
+            - name: SLUICE_LISTEN_AUTHZ
+              value: "0.0.0.0:{{ .Values.service.authzPort }}"
+            {{- if .Values.api.existingSecret }}
+            - name: SLUICE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.api.existingSecret }}
+                  key: {{ .Values.api.secretKey }}
+            {{- else if .Values.api.token }}
+            - name: SLUICE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sluice.fullname" . }}-api
+                  key: token
+            {{- end }}
+            {{- if .Values.api.requireAuthForReads }}
+            - name: SLUICE_API_REQUIRE_AUTH_FOR_READS
+              value: "true"
+            {{- end }}
+            {{- if .Values.api.allowAnonymousMutations }}
+            - name: SLUICE_API_ALLOW_ANONYMOUS_MUTATIONS
+              value: "true"
+            {{- end }}
+            {{- with .Values.carbon.electricityMaps.existingSecret }}
             - name: SLUICE_ELECTRICITY_MAPS_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ . }}
                   key: {{ $.Values.carbon.electricityMaps.key }}
-          {{- end }}
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           securityContext:

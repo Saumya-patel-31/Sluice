@@ -36,7 +36,9 @@ metadata:
 data:
   sluice.jsonc: |
     {
-      "listen": { "api": ":8080", "authz": ":8081" },
+      // Bind addresses come from SLUICE_LISTEN_* in the Deployment, so this
+      // file stays identical between a laptop and a pod.
+      "listen": { "api": "127.0.0.1:8080", "authz": "127.0.0.1:8081" },
       "backends": [
         {
           "id": "aws-us-east-1", "cloud": "aws", "region": "us-east-1",
@@ -205,6 +207,22 @@ spec:
             - { name: http, containerPort: 8080 }
             - { name: authz, containerPort: 8081 }
           env:
+            # A pod binds every interface, so the control-plane API is
+            # reachable from the cluster network. Without this token the
+            # process refuses to start rather than exposing an endpoint that
+            # can rewrite the fleet's authorisation policy.
+            #
+            #   kubectl -n sluice create secret generic sluice-secrets \
+            #     --from-literal=api-token="$(openssl rand -hex 32)"
+            - name: SLUICE_LISTEN_API
+              value: 0.0.0.0:8080
+            - name: SLUICE_LISTEN_AUTHZ
+              value: 0.0.0.0:8081
+            - name: SLUICE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sluice-secrets
+                  key: api-token
             # Live grid intensity, if a token is provisioned. Without it Sluice
             # uses its bundled zone dataset shaped by a diurnal model.
             - name: SLUICE_ELECTRICITY_MAPS_TOKEN

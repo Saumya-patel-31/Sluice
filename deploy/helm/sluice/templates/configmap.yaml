@@ -9,3 +9,20 @@ data:
 {{ include "sluice.config" . | indent 4 }}
   policies.sluice: |
 {{ .Values.policy | indent 4 }}
+{{- if and .Values.api.token (not .Values.api.existingSecret) }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "sluice.fullname" . }}-api
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  # Set from values, which means it is in your release history and anyone with
+  # `helm get values` can read it. Prefer api.existingSecret.
+  token: {{ .Values.api.token | quote }}
+{{- end }}
+{{- if and (not .Values.api.token) (not .Values.api.existingSecret) (not .Values.api.allowAnonymousMutations) }}
+{{ fail "sluice: set api.existingSecret (preferred) or api.token — a pod binds every interface, and without a token the control plane refuses to start rather than exposing an API that can rewrite the fleet's authorisation policy. Set api.allowAnonymousMutations=true to override." }}
+{{- end }}

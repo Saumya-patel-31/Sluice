@@ -16,12 +16,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"github.com/saumyapatel/sluice/internal/api"
@@ -43,22 +45,30 @@ func main() {
 
 func run() error {
 	var (
-		configPath = flag.String("config", "", "path to a JSONC configuration file (default: built-in demo topology)")
-		policyPath = flag.String("policy", "", "path to a .sluice policy document (default: built-in policy set)")
-		listen     = flag.String("listen", "", "override the API and dashboard listen address")
-		authzAddr  = flag.String("authz", "", "override the Envoy ext_authz listen address (empty disables)")
-		proxyAddr  = flag.String("proxy", "", "override the native data-plane listen address (empty disables)")
-		demo       = flag.Bool("demo", false, "run the built-in simulator: synthetic regions, traffic and incidents")
-		noDemo     = flag.Bool("no-demo", false, "disable the simulator even if the configuration enables it")
-		livePrices = flag.Bool("live-prices", false, "query provider pricing APIs (only Azure's works without credentials)")
-		logLevel   = flag.String("log-level", "info", "debug, info, warn or error")
-		showVer    = flag.Bool("version", false, "print the version and exit")
-		dumpConf   = flag.Bool("print-config", false, "print the effective configuration as JSON and exit")
+		configPath  = flag.String("config", "", "path to a JSONC configuration file (default: built-in demo topology)")
+		policyPath  = flag.String("policy", "", "path to a .sluice policy document (default: built-in policy set)")
+		listen      = flag.String("listen", "", "override the API and dashboard listen address")
+		authzAddr   = flag.String("authz", "", "override the Envoy ext_authz listen address (empty disables)")
+		proxyAddr   = flag.String("proxy", "", "override the native data-plane listen address (empty disables)")
+		demo        = flag.Bool("demo", false, "run the built-in simulator: synthetic regions, traffic and incidents")
+		noDemo      = flag.Bool("no-demo", false, "disable the simulator even if the configuration enables it")
+		livePrices  = flag.Bool("live-prices", false, "query provider pricing APIs (only Azure's works without credentials)")
+		devInsecure = flag.Bool("dev-insecure", false,
+			"allow unauthenticated mutating API calls on a network-reachable listener — demos only")
+		logLevel = flag.String("log-level", "info", "debug, info, warn or error")
+		showVer  = flag.Bool("version", false, "print the version and exit")
+		dumpConf = flag.Bool("print-config", false, "print the effective configuration as JSON and exit")
+		showEnv  = flag.Bool("print-env", false, "list the recognised environment variables and exit")
 	)
+	flag.Usage = usage
 	flag.Parse()
 
 	if *showVer {
 		fmt.Printf("sluice %s (%s %s/%s)\n", version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+		return nil
+	}
+	if *showEnv {
+		printEnvDocs(os.Stdout)
 		return nil
 	}
 
@@ -91,13 +101,21 @@ func run() error {
 	if *livePrices {
 		cfg.Pricing.Live = true
 	}
+	if *devInsecure {
+		cfg.API.AllowAnonymousMutations = true
+	}
 	if err := cfg.Normalize(); err != nil {
 		return err
 	}
 
 	if *dumpConf {
-		return cfg.Save("/dev/stdout")
+		// Print to stdout directly. Writing to "/dev/stdout" only works where
+		// that device node exists, which excludes Windows and some minimal
+		// container images.
+		return cfg.Render(os.Stdout)
 	}
+
+	warnOnInsecureAPI(log, cfg)
 
 	a, err := app.New(cfg, log, version)
 	if err != nil {
@@ -203,9 +221,68 @@ type namedServer struct {
 
 func loadConfig(path string) (*config.Config, error) {
 	if path == "" {
-		return config.Default(), nil
+		cfg := config.Default()
+		if err := cfg.ApplyEnv(os.Getenv); err != nil {
+			return nil, err
+		}
+		return cfg, nil
 	}
 	return config.Load(path)
+}
+
+func usage() {
+	out := flag.CommandLine.Output()
+	fmt.Fprintf(out, `sluiced — the Sluice control plane
+
+Routes each request to a cloud region by live egress price, grid carbon
+intensity, observed latency and zero-trust policy.
+
+usage: sluiced [flags]
+
+  sluiced --demo                     self-contained demo on http://localhost:8080
+  sluiced --config /etc/sluice.jsonc production, with a config file
+
+flags:
+`)
+	flag.PrintDefaults()
+	fmt.Fprintf(out, "\nenvironment (see --print-env for the full list):\n")
+	fmt.Fprintf(out, "  %sAPI_TOKEN   bearer token required for mutating API calls\n", config.EnvPrefix)
+	fmt.Fprintf(out, "  %sPOLICY_FILE path to the .sluice policy document\n", config.EnvPrefix)
+	fmt.Fprintf(out, "\nPrecedence: built-in defaults < config file < environment < flags.\n")
+}
+
+func printEnvDocs(w io.Writer) {
+	fmt.Fprintln(w, "Sluice reads these environment variables. Any secret also accepts a")
+	fmt.Fprintln(w, "_FILE suffix, which reads the value from that path instead — the")
+	fmt.Fprintln(w, "convention Docker secrets and Kubernetes projected volumes use.")
+	fmt.Fprintln(w)
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	for _, kv := range config.EnvDocs() {
+		fmt.Fprintf(tw, "  %s\t%s\n", kv[0], kv[1])
+	}
+	_ = tw.Flush()
+}
+
+// warnOnInsecureAPI makes an intentionally open write API impossible to
+// operate without noticing.
+//
+// Normalize already refuses the accidental case — network-reachable with no
+// token. This covers the deliberate one, where somebody passed --dev-insecure
+// and then forgot, which is how a demo becomes a staging environment becomes
+// production.
+func warnOnInsecureAPI(log *slog.Logger, cfg *config.Config) {
+	switch {
+	case cfg.API.AllowAnonymousMutations && !config.LoopbackOnly(cfg.Listen.API):
+		log.Warn("THE CONTROL-PLANE WRITE API IS OPEN",
+			"listen", cfg.Listen.API,
+			"impact", "anyone who can reach this address can replace the authorisation policy",
+			"fix", "unset --dev-insecure and set "+config.EnvPrefix+"API_TOKEN")
+	case cfg.API.Token == "" && config.LoopbackOnly(cfg.Listen.API):
+		log.Info("control-plane API is bound to loopback; mutating calls are allowed without a token",
+			"listen", cfg.Listen.API)
+	case cfg.API.Token != "":
+		log.Info("control-plane API requires a bearer token for mutating calls")
+	}
 }
 
 func newLogger(level string) *slog.Logger {

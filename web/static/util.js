@@ -178,6 +178,8 @@ const ICONS = {
   check: '<path d="m5 12 5 5L20 7"/>',
   leaf: '<path d="M11 20A7 7 0 0 1 4 13c0-6 5-9 16-10 0 10-4 16-9 16Z"/><path d="M4 21c2-6 6-9 10-11"/>',
   clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  key: '<circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 8.3-8.3M16 5l3 3M13.5 7.5l3 3"/>',
+  unlock: '<rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 7.5-2"/>',
 };
 
 /** Return an SVG icon by name, or an empty string if unknown. */

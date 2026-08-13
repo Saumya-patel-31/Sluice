@@ -141,9 +141,10 @@ func (g *Generator) init() {
 		if len(g.Profiles) == 0 {
 			g.Profiles = DefaultProfiles()
 		}
-		if g.RPS <= 0 {
-			g.RPS = 60
-		}
+		// No default substitution for RPS. A caller that asked for zero wants
+		// a quiet system — for a test that drives its own traffic, or an
+		// operator watching an idle fleet — and silently generating 60 req/s
+		// instead makes both impossible.
 		if g.Concurrency <= 0 {
 			g.Concurrency = 96
 		}
@@ -181,9 +182,13 @@ func (g *Generator) pick() *Profile {
 	return &g.Profiles[len(g.Profiles)-1]
 }
 
-// Run drives traffic until ctx is cancelled.
+// Run drives traffic until ctx is cancelled. A rate of zero or less generates
+// nothing and returns immediately.
 func (g *Generator) Run(ctx context.Context) {
 	g.init()
+	if g.RPS <= 0 {
+		return
+	}
 	sem := make(chan struct{}, g.Concurrency)
 	start := time.Now()
 

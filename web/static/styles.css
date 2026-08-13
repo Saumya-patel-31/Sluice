@@ -265,6 +265,28 @@ code, pre, .mono { font-family: var(--font-mono); font-variant-ligatures: none; 
 .btn--primary { background: color-mix(in srgb, var(--ok) 18%, var(--surface-2)); border-color: color-mix(in srgb, var(--ok) 44%, transparent); color: var(--ok); }
 .btn--primary:hover { background: color-mix(in srgb, var(--ok) 26%, var(--surface-2)); border-color: var(--ok); }
 .btn--block { width: 100%; }
+.btn--icon { padding: 6px 11px; min-height: 32px; font-size: 12px; }
+.btn--icon [data-icon] { display: grid; place-items: center; width: 14px; height: 14px; }
+.btn--icon svg { width: 14px; height: 14px; }
+.btn--warn { border-color: color-mix(in srgb, var(--warn) 50%, transparent); color: var(--warn); }
+
+/* ── Token dialog ──────────────────────────────────────────────────────── */
+.tokendlg {
+  width: min(420px, calc(100vw - 32px));
+  padding: 0; border: 1px solid var(--border-hi); border-radius: var(--r-lg);
+  background: var(--surface); color: var(--text);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .6);
+}
+.tokendlg::backdrop { background: rgba(3, 5, 10, .72); backdrop-filter: blur(2px); }
+.tokendlg form { display: flex; flex-direction: column; gap: 14px; padding: 20px; }
+.tokendlg__title { font-size: 15px; font-weight: 620; }
+.tokendlg__body { font-size: 13px; color: var(--text-2); }
+.tokendlg__note { font-size: 11.5px; color: var(--text-3); }
+.tokendlg .field input {
+  min-height: 38px; width: 100%; cursor: text;
+  font-family: var(--font-mono); font-size: 13px;
+}
+.tokendlg__actions { display: flex; justify-content: flex-end; gap: 8px; }
 
 .seg { display: inline-flex; gap: 2px; padding: 3px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-md); flex-wrap: wrap; }
 .seg__btn {

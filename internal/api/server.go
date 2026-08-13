@@ -19,17 +19,31 @@ import (
 
 // Server exposes the control plane over HTTP.
 type Server struct {
-	app *app.App
-	log *slog.Logger
-	mux *http.ServeMux
+	app  *app.App
+	log  *slog.Logger
+	mux  *http.ServeMux
+	auth *Authenticator
 }
 
 // New builds the HTTP surface.
 func New(a *app.App) *Server {
-	s := &Server{app: a, log: a.Log, mux: http.NewServeMux()}
+	s := &Server{
+		app: a,
+		log: a.Log,
+		mux: http.NewServeMux(),
+		auth: NewAuthenticator(
+			a.Cfg.API.Token,
+			a.Cfg.API.RequireAuthForReads,
+			a.Cfg.API.AllowAnonymousMutations,
+			a.Log,
+		),
+	}
 	s.routes()
 	return s
 }
+
+// Auth exposes the authenticator so the app can report its state.
+func (s *Server) Auth() *Authenticator { return s.auth }
 
 // Handler returns the root handler with common middleware applied.
 func (s *Server) Handler() http.Handler {
@@ -37,33 +51,83 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) routes() {
-	m := s.mux
+	// The API lives on its own mux so one Handle call can put every endpoint
+	// behind the authenticator. Registering the middleware per route is how a
+	// new endpoint eventually ships without it.
+	api := http.NewServeMux()
 
-	m.HandleFunc("GET /api/status", s.handleStatus)
-	m.HandleFunc("GET /api/overview", s.handleOverview)
-	m.HandleFunc("GET /api/backends", s.handleBackends)
-	m.HandleFunc("GET /api/backends/{id}/history", s.handleBackendHistory)
-	m.HandleFunc("GET /api/routes", s.handleRoutes)
-	m.HandleFunc("GET /api/topology", s.handleTopology)
-	m.HandleFunc("GET /api/decisions", s.handleDecisions)
-	m.HandleFunc("GET /api/decisions/{id}", s.handleDecision)
-	m.HandleFunc("GET /api/policy", s.handlePolicyGet)
-	m.HandleFunc("PUT /api/policy", s.handlePolicyPut)
-	m.HandleFunc("POST /api/policy/backtest", s.handlePolicyBacktest)
-	m.HandleFunc("GET /api/zones", s.handleZones)
-	m.HandleFunc("GET /api/incidents", s.handleIncidentsGet)
-	m.HandleFunc("POST /api/incidents", s.handleIncidentPost)
-	m.HandleFunc("DELETE /api/incidents/{id}", s.handleIncidentDelete)
-	m.HandleFunc("GET /api/stream", s.handleStream)
+	api.HandleFunc("GET /api/status", s.handleStatus)
+	api.HandleFunc("GET /api/overview", s.handleOverview)
+	api.HandleFunc("GET /api/backends", s.handleBackends)
+	api.HandleFunc("GET /api/backends/{id}/history", s.handleBackendHistory)
+	api.HandleFunc("GET /api/routes", s.handleRoutes)
+	api.HandleFunc("GET /api/topology", s.handleTopology)
+	api.HandleFunc("GET /api/decisions", s.handleDecisions)
+	api.HandleFunc("GET /api/decisions/{id}", s.handleDecision)
+	api.HandleFunc("GET /api/policy", s.handlePolicyGet)
+	api.HandleFunc("PUT /api/policy", s.handlePolicyPut)
+	api.HandleFunc("POST /api/policy/backtest", s.handlePolicyBacktest)
+	api.HandleFunc("GET /api/zones", s.handleZones)
+	api.HandleFunc("GET /api/incidents", s.handleIncidentsGet)
+	api.HandleFunc("POST /api/incidents", s.handleIncidentPost)
+	api.HandleFunc("DELETE /api/incidents/{id}", s.handleIncidentDelete)
+	api.HandleFunc("GET /api/stream", s.handleStream)
 
-	m.HandleFunc("GET /metrics", s.handleMetrics)
-	m.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+	// Anything else under /api is a client error, not a page. Falling through
+	// to the dashboard handler would answer a mistyped endpoint with 200 and a
+	// lump of HTML, which every API client parses as success.
+	api.HandleFunc("/api/", s.handleAPINotFound)
+
+	s.mux.Handle("/api/", s.auth.Middleware(api))
+
+	// /metrics carries cost and topology detail, so it follows the read
+	// policy. Prometheus can send an Authorization header when that is on.
+	s.mux.Handle("GET /metrics", s.auth.Middleware(http.HandlerFunc(s.handleMetrics)))
+
+	// Liveness and readiness stay open unconditionally: they expose nothing,
+	// and a probe that needs a credential is a probe that fails during the
+	// exact incident where the credential source is unavailable.
+	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	m.HandleFunc("GET /readyz", s.handleReady)
+	s.mux.HandleFunc("GET /readyz", s.handleReady)
 
-	m.Handle("GET /", web.Handler())
+	// Registered without a method, because "GET /" and "/api/" are an
+	// ambiguous pair to ServeMux — one is more specific by method, the other
+	// by path, so it refuses to choose. Method filtering happens in the
+	// handler instead, which also lets a POST to a page return 405 rather
+	// than the 404 the mux would have produced.
+	s.mux.Handle("/", dashboardOnlyGET(web.Handler()))
+}
+
+// dashboardOnlyGET serves the dashboard for reads and refuses everything else.
+func dashboardOnlyGET(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+			next.ServeHTTP(w, r)
+		default:
+			w.Header().Set("Allow", "GET, HEAD")
+			writeError(w, http.StatusMethodNotAllowed, r.Method+" is not allowed on "+r.URL.Path)
+		}
+	})
+}
+
+// handleAPINotFound answers unmatched API paths in the API's own format.
+func (s *Server) handleAPINotFound(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusNotFound, map[string]any{
+		"error":  "unknown_endpoint",
+		"detail": r.Method + " " + r.URL.Path + " is not a Sluice API endpoint",
+		"endpoints": []string{
+			"GET /api/status", "GET /api/overview", "GET /api/backends",
+			"GET /api/backends/{id}/history", "GET /api/routes", "GET /api/topology",
+			"GET /api/decisions", "GET /api/decisions/{id}", "GET /api/zones",
+			"GET /api/policy", "PUT /api/policy", "POST /api/policy/backtest",
+			"GET /api/incidents", "POST /api/incidents", "DELETE /api/incidents/{id}",
+			"GET /api/stream",
+		},
+	})
 }
 
 // securityHeaders applies a conservative baseline to every response.
@@ -142,6 +206,10 @@ func (s *Server) status() Status {
 		Routes:         len(a.Engine.Routes()),
 		PriceTableAsOf: signals.PriceTableAsOf,
 		CarbonModel:    a.Store.CarbonModel(),
+
+		AuthEnabled:        s.auth.Enabled(),
+		AnonymousMutations: a.Cfg.API.AllowAnonymousMutations,
+		DeniedAPIRequests:  s.auth.Denied(),
 	}
 }
 
