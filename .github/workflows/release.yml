@@ -1,0 +1,170 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write   # create the release and upload artefacts
+  packages: write   # push to GHCR
+  id-token: write   # keyless signing
+  attestations: write
+
+env:
+  GO_VERSION: "1.26.6"   # floor set by govulncheck; see go.mod
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository }}
+
+jobs:
+  # Nothing gets published from a tree that does not pass its own suite. The
+  # race detector runs here because the control plane swaps state under a live
+  # request path and a data race would be a routing bug nobody could reproduce.
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - run: go vet ./...
+      - run: go test -race -count=2 ./...
+
+      - name: Vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  binaries:
+    name: binaries
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # git describe needs the tags
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Cross-compile
+        run: |
+          VERSION="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            os="${target%/*}"; arch="${target#*/}"
+            ext=""; [ "$os" = "windows" ] && ext=".exe"
+            outdir="dist/sluice_${VERSION}_${os}_${arch}"
+            mkdir -p "$outdir"
+            for cmd in sluiced sluicectl sluice-upstream; do
+              CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+                go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+                -o "$outdir/${cmd}${ext}" "./cmd/$cmd"
+            done
+            cp README.md LICENSE "$outdir/"
+            (cd dist && tar czf "$(basename "$outdir").tar.gz" "$(basename "$outdir")")
+          done
+          # A checksum file is what lets anyone verify a download without
+          # trusting the transport it arrived over.
+          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: dist/*.tar.gz
+
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true
+
+  image:
+    name: image
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+
+      # arm64 as well as amd64: Graviton and Ampere nodes are ordinary now, and
+      # a control plane that only ships amd64 forces an emulated sidecar.
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      # A signed provenance attestation lets a consumer verify this image came
+      # from this workflow and this commit, rather than from someone with push
+      # rights to the registry.
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  sbom:
+    name: sbom
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # Sluice has no third-party modules, so this SBOM is short by design —
+      # which is the point worth being able to demonstrate rather than assert.
+      - name: Generate a CycloneDX SBOM
+        run: |
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
+          cyclonedx-gomod mod -json -output sbom.json .
+          echo "components:"
+          grep -c '"bom-ref"' sbom.json || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: sbom.json

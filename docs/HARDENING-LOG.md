@@ -211,6 +211,35 @@ The wrapper preserves `http.Flusher`, which has a test of its own — hiding it
 would silently buffer the event stream and the dashboard would just stop
 updating.
 
+### SLU-109 · Five reachable standard-library vulnerabilities
+
+**Severity: high.** The first `govulncheck` run the project has ever had
+reported five vulnerabilities in the Go 1.26.5 standard library that Sluice's
+own code paths reach — not transitively-imported-but-unused, *called*:
+
+```
+GO-2026-5972  encoding/asn1 recursion depth
+  internal/proxy/proxy.go:334  proxy.buildTLS → tls.LoadX509KeyPair → asn1.Unmarshal
+GO-2026-5026  net/http via golang.org/x/net/idna punycode handling
+  internal/signals/probe.go:154  Prober.ProbeOnce → http.Client.Do
+  internal/proxy/proxy.go:218    Proxy.ServeHTTP → ReverseProxy → Transport.RoundTrip
+```
+
+The asn1 path runs when the data plane loads its certificates; the net/http
+path runs on every probe and every proxied request. All five are fixed in
+1.26.6.
+
+This is the finding that justifies the whole supply-chain job. A project with
+zero third-party modules still has a dependency — the standard library — and
+"we have no dependencies" is not the same as "we have nothing to patch".
+
+**Fixed:** `toolchain go1.26.6` in `go.mod`. That is a floor rather than a
+preference: the go command downloads it automatically, so a contributor on an
+older release cannot build a vulnerable binary by accident. CI and the
+Dockerfile pin the same version.
+
+**Verified:** `govulncheck ./...` now reports *No vulnerabilities found*.
+
 ### SLU-106 · `docker build` reported success when the daemon was down
 
 **Severity: low, but it wasted a cycle.** The first image build "succeeded"
@@ -463,32 +492,56 @@ Live checks against a running instance, before and after:
 
 ---
 
+## Verification for pass 2
+
+The dashboard was re-checked against the live compose stack after the auth
+changes, since those touched the front end too: SSE connected, six KPI tiles
+populated, twenty-four decisions in the feed, no console errors, and the token
+button correctly reporting `token needed`.
+
+The credential flow was exercised end to end in the browser: a backtest with no
+token returned 401, the dialog opened by itself, the entered token was stored in
+`sessionStorage`, the request was retried automatically, and the backtest ran
+against 800 real decisions from the running stack.
+
+| Probe | Result |
+|---|---|
+| `envoy --mode validate` | OK (was: rejected the whole bootstrap) |
+| no client certificate | refused at the TLS handshake |
+| valid chain, untrusted domain | `403 unrecognised trust domain` |
+| valid workload certificate | `200`, served by a real upstream |
+| upstream requests served | 1,311 across three regions (was: 0) |
+| image smoke test | ready, 259 metric series, non-root, dashboard serving |
+
+---
+
 ## Known gaps, carried forward
 
-Ordered by what I would do next.
+Closed in pass 2: the image builds and runs, the Envoy config loads and routes,
+mTLS is demonstrated end to end, request logging and correlation exist, the SSE
+cap is in, and the runbook is written.
 
-1. **The container image has never been built.** `docker build` is wired into CI
-   but has not run locally, and the compose stack with a real Envoy has not been
-   exercised end to end.
-2. **The Envoy config uses YAML anchors and merge keys** for the upstream
-   clusters. Envoy's parser should handle them, but "should" is not "verified",
-   and a config that fails to load takes the data plane with it.
-3. **The Helm chart has never been rendered** — `helm` is not installed on this
-   machine. CI lints and templates it; that has not run either.
-4. **No release pipeline.** No image publishing, no SBOM, no `govulncheck`, no
-   signed artefacts, no multi-arch build.
-5. **The race detector has never run.** The local toolchain's gcc is 32-bit
-   only. CI runs it on Linux; that job has not executed yet.
-6. **No structured request logging or trace propagation** in the control plane.
-   Decisions carry an ID but it is not tied to an inbound trace header.
-7. **No pprof endpoint**, so a production latency regression has no profiling
-   path.
-8. **SSE has no connection cap.** A misbehaving client could open subscribers
-   without bound.
-9. **mTLS is implemented but undemonstrated.** There is no certificate
-   generation helper, so the data plane's identity path cannot be tried
-   locally.
-10. **No runbook** — no documented response for a stuck breaker, a policy
-    rollback, or a region drain.
-11. **No Grafana dashboard**, despite shipping the metrics and alert rules for
-    one.
+Remaining, ordered by what I would do next.
+
+1. **Nothing in CI has ever executed.** Every workflow here is unproven —
+   including the two new jobs that guard the bugs found in pass 2. They need a
+   remote and one push to prove themselves.
+2. **The Helm chart has never been rendered.** `helm` is not installed on this
+   machine. CI lints and templates it, and now also asserts the chart refuses
+   to render without an API token — unverified until CI runs.
+3. **The race detector has never run.** The local toolchain's gcc is 32-bit
+   only. It is wired into both CI and the release workflow.
+4. **No Grafana dashboard**, despite shipping the metrics and the alert rules
+   for one.
+5. **No pprof endpoint**, so a production latency regression has no profiling
+   path. It needs to be opt-in and behind the auth gate — an open pprof handler
+   is a memory-dump endpoint.
+6. **The release workflow is written but untagged.** Multi-arch publishing,
+   SBOM, provenance attestation and checksums all exist on paper only.
+7. **`allowed_headers` on ext_authz is deprecated** and Envoy warns on every
+   load. It is load-bearing — without it the identity header never arrives —
+   so the upgrade path needs establishing before Envoy removes it.
+8. **No load test.** Decision cost is measured at demo rates (~100 req/s). The
+   claim that this belongs in a request path is untested at four figures.
+9. **Kubernetes manifests are unapplied.** They have never met a real API
+   server, so the probes, the PDB and the NetworkPolicy are all theory.
