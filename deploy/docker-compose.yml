@@ -1,0 +1,141 @@
+# End-to-end Sluice deployment: a real Envoy data plane, three synthetic
+# regions on separate hosts, and the control plane deciding between them.
+#
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+#   dashboard   http://localhost:8080
+#   through it  curl -H 'x-forwarded-client-cert: By=spiffe://prod.internal/ns/mesh/sa/gw;URI=spiffe://prod.internal/ns/web/sa/feed' \
+#                    http://localhost:10000/api/v1/feed -D-
+#   metrics     http://localhost:8080/metrics
+#
+# The curl above is what a mesh sidecar would send. Without that header the
+# request is anonymous, and the baseline policy refuses it — which is the point.
+
+name: sluice
+
+services:
+  # ── Control plane ──────────────────────────────────────────────────────────
+  sluiced:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        VERSION: compose
+    command:
+      - --config=/etc/sluice/sluice.jsonc
+      - --log-level=info
+    volumes:
+      - ../configs/compose.jsonc:/etc/sluice/sluice.jsonc:ro
+      - ../configs/policies.sluice:/etc/sluice/policies.sluice:ro
+    ports:
+      - "8080:8080"   # dashboard, REST API, /metrics
+      - "8081:8081"   # Envoy ext_authz
+    depends_on:
+      upstream-aws: { condition: service_healthy }
+      upstream-gcp: { condition: service_healthy }
+      upstream-azure: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── Data plane ─────────────────────────────────────────────────────────────
+  envoy:
+    image: envoyproxy/envoy:v1.32-latest
+    command: ["-c", "/etc/envoy/envoy.yaml", "--service-cluster", "sluice-edge"]
+    volumes:
+      - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - "10000:10000"  # proxied traffic
+      - "9901:9901"    # Envoy admin
+    depends_on:
+      sluiced: { condition: service_healthy }
+    restart: unless-stopped
+
+  # ── Synthetic regions ──────────────────────────────────────────────────────
+  # A few milliseconds behind GCP, at 25% lower egress cost and on the same
+  # fossil-heavy grid. This is where cost-aware routing should send most
+  # interactive traffic.
+  upstream-aws:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    entrypoint: ["/usr/local/bin/sluice-upstream"]
+    environment:
+      REGION: us-east-1
+      LATENCY_MS: "24"
+      ERROR_RATE: "0.001"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+    restart: unless-stopped
+
+  # The fastest region, and the most expensive egress of the three — Google's
+  # premium tier lists at $0.12/GB against Azure's $0.087. A latency-only
+  # balancer sends everything here and pays that premium on every byte.
+  upstream-gcp:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    entrypoint: ["/usr/local/bin/sluice-upstream"]
+    environment:
+      REGION: us-central1
+      LATENCY_MS: "20"
+      ERROR_RATE: "0.0015"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+    restart: unless-stopped
+
+  # Cheapest egress and roughly six times cleaner per byte, but 80ms away.
+  # Batch traffic should drift here; the interactive SLO should keep it out.
+  upstream-azure:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    entrypoint: ["/usr/local/bin/sluice-upstream"]
+    environment:
+      REGION: francecentral
+      LATENCY_MS: "88"
+      ERROR_RATE: "0.001"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Load ───────────────────────────────────────────────────────────────────
+  # A trickle of authenticated traffic so the dashboard has something to show
+  # without anyone having to drive it by hand. Remove this service to observe a
+  # quiet system.
+  loadgen:
+    image: alpine:3.21
+    depends_on:
+      envoy: { condition: service_started }
+    command:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache curl >/dev/null
+        XFCC='By=spiffe://prod.internal/ns/mesh/sa/gateway;Hash=demo;URI=spiffe://prod.internal/ns/web/sa/feed'
+        ETL='By=spiffe://prod.internal/ns/mesh/sa/gateway;Hash=demo;URI=spiffe://prod.internal/ns/data/sa/etl'
+        while true; do
+          for i in 1 2 3 4 5 6; do
+            curl -s -o /dev/null -H "x-forwarded-client-cert: $$XFCC" \
+              -H 'x-sluice-bytes: 8192' http://envoy:10000/api/v1/feed &
+          done
+          curl -s -o /dev/null -H "x-forwarded-client-cert: $$ETL" \
+            -H 'x-sluice-bytes: 262144' http://envoy:10000/batch/reindex &
+          # An unauthenticated probe, which the baseline policy must refuse.
+          curl -s -o /dev/null http://envoy:10000/api/v1/feed &
+          sleep 0.4
+        done
+    restart: unless-stopped

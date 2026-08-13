@@ -1,0 +1,33 @@
+# Build output
+/sluiced
+/sluicectl
+/sluice-upstream
+/bin/
+/dist/
+*.exe
+*.test
+
+# Coverage and profiles
+coverage.out
+coverage.html
+*.prof
+*.pprof
+
+# Local overrides — a real deployment's topology and negotiated egress rates
+# are not something to commit.
+/configs/local.jsonc
+/configs/*.local.*
+*.local.sluice
+
+# TLS material for local mTLS experiments
+/certs/
+*.pem
+*.key
+*.crt
+
+# Editors and OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

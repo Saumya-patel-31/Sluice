@@ -1,0 +1,21 @@
+apiVersion: v2
+name: sluice
+description: Zero-trust multi-cloud traffic router — routes by live egress price, grid carbon intensity, latency and policy.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - traffic-management
+  - zero-trust
+  - finops
+  - sustainability
+  - envoy
+  - multi-cloud
+home: https://github.com/saumyapatel/sluice
+sources:
+  - https://github.com/saumyapatel/sluice
+maintainers:
+  - name: Saumya Patel
+annotations:
+  artifacthub.io/license: MIT
+  artifacthub.io/prerelease: "true"

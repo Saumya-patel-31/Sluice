@@ -1,0 +1,148 @@
+# Prometheus rules for Sluice.
+#
+# The alerts are grouped by what an operator would actually do about them:
+# availability first, then the guardrails that keep cost optimisation from
+# quietly damaging the service, then signal quality — because a router
+# optimising against stale prices is making confident decisions on fiction.
+
+groups:
+  - name: sluice.availability
+    rules:
+      - alert: SluiceDown
+        expr: up{job=~".*sluice.*"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Sluice control plane is unreachable"
+          description: >-
+            Envoy's ext_authz filter is configured to fail closed, so every
+            request through the data plane is being refused while this is true.
+
+      - alert: SluiceNoTrafficPlan
+        expr: max by (route) (sluice_route_plan_generation) == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Route {{ $labels.route }} has never published a traffic plan"
+          description: >-
+            The control loop has not produced a distribution for this route, so
+            every request to it is denied for want of a plan.
+
+      - alert: SluiceAllBackendsEjected
+        expr: |
+          count by (route) (sluice_backend_traffic_share > 0) == 0
+          and on() count(sluice_backend_circuit_state) > 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "No backend is carrying traffic for route {{ $labels.route }}"
+
+      - alert: SluiceDenialRateHigh
+        expr: |
+          sum(rate(sluice_decisions_total{verdict!="allow"}[5m]))
+          / clamp_min(sum(rate(sluice_decisions_total[5m])), 0.001) > 0.25
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "More than a quarter of requests are being refused"
+          description: >-
+            Check sluice_denials_total by reason. A policy edit that broadened a
+            deny is the usual cause; the decision ledger records which rule fired.
+
+  - name: sluice.guardrails
+    rules:
+      - alert: SluiceSLOBreached
+        expr: sluice_route_slo_met == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Route {{ $labels.route }} is projected to miss its latency SLO"
+          description: >-
+            The SLO guardrail sheds the slowest backends until the projected
+            blend fits. Still breaching means even the fastest remaining
+            candidate is too slow — this is a capacity or upstream problem, not
+            a routing one.
+
+      - alert: SluiceCircuitOpen
+        expr: sluice_backend_circuit_state == 2
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "Circuit open for {{ $labels.backend }} ({{ $labels.cloud }} {{ $labels.region }})"
+
+      - alert: SluicePlanChurnHigh
+        expr: avg_over_time(sluice_route_plan_churn[10m]) > 0.35
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Traffic distribution for {{ $labels.route }} is thrashing"
+          description: >-
+            The distribution is moving more than a third of its mass on a
+            sustained basis. Raise router.smoothing or router.deadband, or look
+            for a signal oscillating underneath it.
+
+      - alert: SluiceSpendingMoreThanBaseline
+        expr: |
+          sum(rate(sluice_egress_cost_added_usd_total[30m]))
+          > 2 * sum(rate(sluice_egress_cost_avoided_usd_total[30m]))
+        for: 30m
+        labels: { severity: info }
+        annotations:
+          summary: "Routing is costing more than a latency-only balancer would"
+          description: >-
+            Expected when carbon is weighted heavily, and reported rather than
+            hidden. If that is not the intent, check the prefer policies and the
+            route objectives.
+
+  - name: sluice.signals
+    rules:
+      - alert: SluiceStaleSignal
+        expr: sluice_signal_age_seconds > 7200
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.signal }} for {{ $labels.backend }} is over two hours old"
+          description: >-
+            The router is still making confident decisions against this number.
+            Check the pricing or carbon provider it comes from.
+
+      - alert: SluiceDecisionLatencyHigh
+        expr: |
+          histogram_quantile(0.99, sum by (le, route) (rate(sluice_decision_duration_seconds_bucket[5m]))) > 0.005
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Decisions for {{ $labels.route }} are taking over 5ms at p99"
+          description: >-
+            This sits in the request path. Check the policy cache hit ratio and
+            the number of constraint policies against the candidate count.
+
+      - alert: SluicePolicyCacheIneffective
+        expr: sluice_policy_cache_hit_ratio < 0.5
+        for: 30m
+        labels: { severity: info }
+        annotations:
+          summary: "Authorisation cache hit rate is below 50%"
+          description: >-
+            Usually means a high-cardinality attribute is in the cache key —
+            a policy reading a unique request header, for example.
+
+  - name: sluice.recording
+    rules:
+      # Pre-aggregated series for dashboards, so a wall display does not
+      # re-derive these on every refresh.
+      - record: sluice:decisions:rate5m
+        expr: sum by (route, verdict) (rate(sluice_decisions_total[5m]))
+
+      - record: sluice:net_savings_usd:rate1h
+        expr: >-
+          sum(rate(sluice_egress_cost_avoided_usd_total[1h]))
+          - sum(rate(sluice_egress_cost_added_usd_total[1h]))
+
+      - record: sluice:net_carbon_grams:rate1h
+        expr: >-
+          sum(rate(sluice_carbon_avoided_grams_total[1h]))
+          - sum(rate(sluice_carbon_added_grams_total[1h]))
+
+      - record: sluice:traffic_share:by_cloud
+        expr: sum by (cloud) (sluice_backend_traffic_share)

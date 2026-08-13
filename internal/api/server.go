@@ -1,0 +1,367 @@
+// Package api serves the Sluice control-plane REST API, the live event
+// stream, the Prometheus endpoint and the embedded dashboard.
+package api
+
+import (
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/saumyapatel/sluice/internal/app"
+	"github.com/saumyapatel/sluice/internal/model"
+	"github.com/saumyapatel/sluice/internal/signals"
+	"github.com/saumyapatel/sluice/web"
+)
+
+// Server exposes the control plane over HTTP.
+type Server struct {
+	app *app.App
+	log *slog.Logger
+	mux *http.ServeMux
+}
+
+// New builds the HTTP surface.
+func New(a *app.App) *Server {
+	s := &Server{app: a, log: a.Log, mux: http.NewServeMux()}
+	s.routes()
+	return s
+}
+
+// Handler returns the root handler with common middleware applied.
+func (s *Server) Handler() http.Handler {
+	return securityHeaders(s.mux)
+}
+
+func (s *Server) routes() {
+	m := s.mux
+
+	m.HandleFunc("GET /api/status", s.handleStatus)
+	m.HandleFunc("GET /api/overview", s.handleOverview)
+	m.HandleFunc("GET /api/backends", s.handleBackends)
+	m.HandleFunc("GET /api/backends/{id}/history", s.handleBackendHistory)
+	m.HandleFunc("GET /api/routes", s.handleRoutes)
+	m.HandleFunc("GET /api/topology", s.handleTopology)
+	m.HandleFunc("GET /api/decisions", s.handleDecisions)
+	m.HandleFunc("GET /api/decisions/{id}", s.handleDecision)
+	m.HandleFunc("GET /api/policy", s.handlePolicyGet)
+	m.HandleFunc("PUT /api/policy", s.handlePolicyPut)
+	m.HandleFunc("POST /api/policy/backtest", s.handlePolicyBacktest)
+	m.HandleFunc("GET /api/zones", s.handleZones)
+	m.HandleFunc("GET /api/incidents", s.handleIncidentsGet)
+	m.HandleFunc("POST /api/incidents", s.handleIncidentPost)
+	m.HandleFunc("DELETE /api/incidents/{id}", s.handleIncidentDelete)
+	m.HandleFunc("GET /api/stream", s.handleStream)
+
+	m.HandleFunc("GET /metrics", s.handleMetrics)
+	m.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	m.HandleFunc("GET /readyz", s.handleReady)
+
+	m.Handle("GET /", web.Handler())
+}
+
+// securityHeaders applies a conservative baseline to every response.
+//
+// The dashboard is entirely self-contained — no CDN scripts, no external
+// fonts, no remote images — so it can run under a content security policy
+// that forbids every external origin. A control plane that can authorise
+// traffic should not itself be loading code from the internet.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Content-Security-Policy",
+			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "+
+				"img-src 'self' data:; font-src 'self'; connect-src 'self'; "+
+				"base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func queryInt(r *http.Request, key string, def, min, max int) int {
+	v := r.URL.Query().Get(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	if n < min {
+		return min
+	}
+	if n > max {
+		return max
+	}
+	return n
+}
+
+// -----------------------------------------------------------------------------
+// Status and overview
+// -----------------------------------------------------------------------------
+
+func (s *Server) status() Status {
+	a := s.app
+	set := a.Engine.Policy()
+	return Status{
+		Version:        a.Version,
+		StartedAt:      a.StartedAt,
+		UptimeSeconds:  a.Uptime().Seconds(),
+		PolicyHash:     set.Hash(),
+		PolicyCount:    set.Len(),
+		PolicyPath:     a.PolicyPath(),
+		PolicyLoaded:   set.LoadedAt(),
+		Generation:     a.Engine.Generation(),
+		DemoMode:       a.Fleet != nil,
+		Backends:       len(a.Store.Backends()),
+		Routes:         len(a.Engine.Routes()),
+		PriceTableAsOf: signals.PriceTableAsOf,
+		CarbonModel:    a.Store.CarbonModel(),
+	}
+}
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.status())
+}
+
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	// Ready means the control loop has produced at least one distribution.
+	// Before that the router would deny everything for lack of a plan, and
+	// reporting ready would send it traffic it cannot serve.
+	if s.app.Engine.Generation() == 0 {
+		writeError(w, http.StatusServiceUnavailable, "no traffic plan computed yet")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ready":      true,
+		"generation": s.app.Engine.Generation(),
+	})
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	_, _ = s.app.Registry.WriteTo(w)
+}
+
+// buildOverview assembles the dashboard's primary payload.
+func (s *Server) buildOverview(seriesPoints int) Overview {
+	a := s.app
+	snap := a.Engine.Snapshot()
+	plans := a.Engine.Plans()
+	backendRPS := a.Engine.BackendRPS()
+	summary := a.Ledger.Summary()
+
+	ov := Overview{
+		Status:  s.status(),
+		Summary: summary,
+		Now:     time.Now(),
+		Series:  a.Rollup.All(seriesPoints),
+	}
+
+	// Per-backend view, including the largest share it holds on any route.
+	shareOf := map[string]float64{}
+	perRoute := map[string]map[string]float64{}
+	for routeID, plan := range plans {
+		for id, wgt := range plan.Weights {
+			if wgt > shareOf[id] {
+				shareOf[id] = wgt
+			}
+			if perRoute[id] == nil {
+				perRoute[id] = map[string]float64{}
+			}
+			perRoute[id][routeID] = wgt
+		}
+	}
+
+	type cloudAgg struct {
+		backends, healthy      int
+		share, rps             float64
+		price, carbon, latency float64
+		spent, emitted         float64
+	}
+	agg := map[model.Cloud]*cloudAgg{}
+
+	var (
+		healthy, openBreakers, stale int
+		totalBytes                   int64
+	)
+
+	for _, b := range snap.Backends {
+		zone, _ := signals.ZoneFor(b.Backend)
+		view := BackendView{
+			BackendState: b,
+			Share:        shareOf[b.Backend.ID],
+			PerRoute:     perRoute[b.Backend.ID],
+			RPS:          backendRPS[b.Backend.ID],
+			Zone:         zone,
+		}
+		ov.Backends = append(ov.Backends, view)
+
+		if b.Healthy {
+			healthy++
+		}
+		if b.Breaker.State == signals.BreakerOpen {
+			openBreakers++
+		}
+		stale += len(b.Stale)
+		totalBytes += b.BytesOut
+
+		c := agg[b.Backend.Cloud]
+		if c == nil {
+			c = &cloudAgg{}
+			agg[b.Backend.Cloud] = c
+		}
+		c.backends++
+		if b.Healthy {
+			c.healthy++
+		}
+		c.share += view.Share
+		c.rps += view.RPS
+		c.price += b.Egress.Value
+		c.carbon += b.CarbonPerGB.Value
+		c.latency += b.LatencyP95.Value
+		c.spent += b.SpentUSD
+		c.emitted += b.EmittedGrams
+	}
+
+	for cloud, c := range agg {
+		n := float64(c.backends)
+		ov.Clouds = append(ov.Clouds, CloudSummary{
+			Cloud: cloud, Display: cloud.Display(),
+			Backends: c.backends, Healthy: c.healthy,
+			Share: c.share, RPS: c.rps,
+			Decisions:   summary.ByCloud[string(cloud)],
+			AvgEgress:   c.price / n,
+			AvgCarbon:   c.carbon / n,
+			AvgLatency:  c.latency / n,
+			SpentUSD:    c.spent,
+			EmittedGram: c.emitted,
+		})
+	}
+	sort.Slice(ov.Clouds, func(i, j int) bool { return ov.Clouds[i].Cloud < ov.Clouds[j].Cloud })
+
+	// Routes, and the traffic-weighted p95 across all of them.
+	var totalRPS, weightedP95 float64
+	var breaching int
+	for _, route := range a.Engine.Routes() {
+		plan := plans[route.ID]
+		if plan == nil {
+			continue
+		}
+		rps := a.Engine.RouteRPS(route.ID)
+		totalRPS += rps
+		weightedP95 += rps * plan.ProjectedP95
+		if !plan.SLOMet {
+			breaching++
+		}
+
+		rs := RouteSummary{
+			Route: route, RPS: rps,
+			Weights: plan.Weights, Candidates: plan.Candidates,
+			Objectives:   plan.Objectives,
+			ProjectedP95: plan.ProjectedP95, WorstP95: plan.WorstP95,
+			SLOMet: plan.SLOMet, Churn: plan.Churn, Generation: plan.Generation,
+		}
+		for _, sh := range plan.Shed {
+			rs.Shed = append(rs.Shed, shedView{sh.BackendID, sh.Reason})
+		}
+		ov.Routes = append(ov.Routes, rs)
+	}
+	if totalRPS > 0 {
+		weightedP95 /= totalRPS
+	}
+
+	// Decision-latency statistics from the recent ledger window.
+	var meanUs float64
+	var maxUs int64
+	if recent := a.Ledger.Recent(telemetryFilter(200)); len(recent) > 0 {
+		var total int64
+		for _, d := range recent {
+			total += d.ComputeMicros
+			if d.ComputeMicros > maxUs {
+				maxUs = d.ComputeMicros
+			}
+		}
+		meanUs = float64(total) / float64(len(recent))
+	}
+
+	_, _, cacheRate := a.Engine.PolicyCacheStats()
+	allowed := summary.ByVerdict["allow"]
+	denied := summary.ByVerdict["deny"] + summary.ByVerdict["no_capacity"]
+	var allowRate, denyRate float64
+	if summary.Total > 0 {
+		allowRate = float64(allowed) / float64(summary.Total)
+		denyRate = float64(denied) / float64(summary.Total)
+	}
+
+	usdPerHour := lastValue(ov.Series["savings.usdPerHour"])
+	gramsPerHour := lastValue(ov.Series["savings.gramsPerHour"])
+
+	ov.KPIs = KPIs{
+		DecisionsPerSecond:  totalRPS,
+		TotalDecisions:      summary.Total,
+		AllowRate:           allowRate,
+		DenyRate:            denyRate,
+		SavedUSD:            summary.SavedUSD,
+		SavedGrams:          summary.SavedGrams,
+		SavingsUSDPerHour:   usdPerHour,
+		SavingsGramsPerHour: gramsPerHour,
+		ProjectedAnnualUSD:  usdPerHour * 24 * 365,
+		EquivalentKmDriven:  summary.SavedGrams / 120,
+		LatencyDebtMs:       summary.LatencyDebtMs,
+		BlendedP95Ms:        weightedP95,
+		DecisionMeanUs:      meanUs,
+		DecisionMaxUs:       maxUs,
+		PolicyCacheHitRate:  cacheRate,
+		HealthyBackends:     healthy,
+		TotalBackends:       len(snap.Backends),
+		OpenBreakers:        openBreakers,
+		StaleSignals:        stale,
+		RoutesBreachingSLO:  breaching,
+		BytesRouted:         totalBytes,
+	}
+
+	ov.Incidents = s.incidentViews()
+	return ov
+}
+
+func lastValue(pts []signals.Point) float64 {
+	if len(pts) == 0 {
+		return 0
+	}
+	return pts[len(pts)-1].V
+}
+
+func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.buildOverview(queryInt(r, "points", 120, 8, 600)))
+}
+
+// normalizePathID guards against a path parameter containing separators.
+func normalizePathID(s string) string {
+	return strings.TrimSpace(strings.ReplaceAll(s, "/", ""))
+}

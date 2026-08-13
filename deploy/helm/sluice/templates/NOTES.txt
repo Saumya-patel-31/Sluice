@@ -1,0 +1,45 @@
+Sluice {{ .Chart.AppVersion }} is installed as {{ include "sluice.fullname" . }}.
+
+Dashboard:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "sluice.fullname" . }} {{ .Values.service.httpPort }}:{{ .Values.service.httpPort }}
+  open http://localhost:{{ .Values.service.httpPort }}
+
+Point Envoy's ext_authz filter at:
+  http://{{ include "sluice.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.authzPort }}
+
+  ...and configure authorization_response.allowed_upstream_headers with the
+  prefix `x-sluice-`. Appending those headers is what clears Envoy's route
+  cache, which is what lets the authorisation response choose the destination.
+  Set failure_mode_allow: false — an authorisation service that cannot be
+  reached has not authorised anything.
+
+Routing {{ len .Values.backends }} backends across {{ len .Values.routes }} routes:
+{{- range .Values.routes }}
+  {{ printf "%-12s %-16s" .id .pathPrefix }}{{ if .latencySloMs }}p95 SLO {{ .latencySloMs }}ms{{ else }}no latency SLO{{ end }}
+{{- end }}
+
+Verify the policy set compiled and traffic is flowing:
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "sluice.fullname" . }} -- sluicectl status
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "sluice.fullname" . }} -- sluicectl backends
+
+Explain any decision:
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "sluice.fullname" . }} -- sluicectl explain <decision-id>
+
+{{- if not .Values.serviceMonitor.enabled }}
+
+Metrics are exposed at /metrics but no ServiceMonitor was created. Set
+serviceMonitor.enabled=true if you run the Prometheus Operator.
+{{- end }}
+
+{{- $hasCatchAll := false }}
+{{- range .Values.routes }}{{ if or (eq .pathPrefix "/") (eq .pathPrefix "") }}{{ $hasCatchAll = true }}{{ end }}{{ end }}
+{{- if not $hasCatchAll }}
+
+WARNING: no route matches "/". Requests outside every configured prefix will be
+denied for want of a route, and Sluice will refuse to start.
+{{- end }}
+
+The carbon figures assume {{ .Values.carbon.energyKwhPerGb }} kWh per GB of network
+transfer. Published estimates span roughly 0.004 to 0.06 depending on
+methodology; set carbon.energyKwhPerGb to the figure your organisation reports
+against.

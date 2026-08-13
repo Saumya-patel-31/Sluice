@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sluice.fullname" . }}
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "sluice.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        {{- include "sluice.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Roll the pods when the routing configuration or the policy document
+        # changes. The policy file is also watched at runtime, but a topology
+        # change needs a restart, and a checksum annotation is the standard way
+        # to make `helm upgrade` actually apply one.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "sluice.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "sluice.selectorLabels" . | nindent 14 }}
+      containers:
+        - name: sluiced
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config=/etc/sluice/sluice.json
+            - --log-level=info
+          ports:
+            - { name: http, containerPort: {{ .Values.service.httpPort }} }
+            - { name: authz, containerPort: {{ .Values.service.authzPort }} }
+          {{- with .Values.carbon.electricityMaps.existingSecret }}
+          env:
+            - name: SLUICE_ELECTRICITY_MAPS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.carbon.electricityMaps.key }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          # Readiness requires a computed traffic distribution, not just a
+          # listening socket: before the first control loop finishes, the
+          # router denies everything for want of a plan.
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 2
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 15
+          volumeMounts:
+            - { name: config, mountPath: /etc/sluice/sluice.json, subPath: sluice.json, readOnly: true }
+            - { name: config, mountPath: /etc/sluice/policies.sluice, subPath: policies.sluice, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "sluice.fullname" . }}
+        - name: tmp
+          emptyDir: {}
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}

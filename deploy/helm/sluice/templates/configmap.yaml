@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sluice.fullname" . }}
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+data:
+  sluice.json: |
+{{ include "sluice.config" . | indent 4 }}
+  policies.sluice: |
+{{ .Values.policy | indent 4 }}

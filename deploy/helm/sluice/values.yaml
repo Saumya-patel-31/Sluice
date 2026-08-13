@@ -1,0 +1,219 @@
+# Default values for the Sluice chart.
+
+replicaCount: 2
+
+image:
+  repository: ghcr.io/saumyapatel/sluice
+  tag: ""            # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  httpPort: 8080     # dashboard, REST API, /metrics
+  authzPort: 8081    # Envoy ext_authz
+
+# Sluice reads no Kubernetes API objects, so its service account needs no
+# permissions and no mounted token.
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: /metrics
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Requires the Prometheus Operator.
+serviceMonitor:
+  enabled: false
+  interval: 15s
+  labels: {}
+
+# Ships the recording and alerting rules from deploy/prometheus.
+prometheusRules:
+  enabled: false
+  labels: {}
+
+# ── Routing configuration ────────────────────────────────────────────────────
+
+# Each backend is one deployment of the service in one cloud region.
+#
+# jurisdiction drives residency policy and gridZone drives the carbon model.
+# Note that two providers in the same metro often share a grid zone, so
+# "failing over to the other cloud" there does nothing for emissions — the
+# zone mapping is what makes that visible.
+backends:
+  - id: aws-us-east-1
+    cloud: aws
+    region: us-east-1
+    displayName: AWS N. Virginia
+    address: http://checkout.aws-us-east-1.svc.cluster.local:8080
+    jurisdiction: US
+    gridZone: US-MIDA-PJM
+    tier: primary
+    capacityRps: 400
+    enabled: true
+  - id: gcp-us-central1
+    cloud: gcp
+    region: us-central1
+    displayName: Google Iowa
+    address: http://checkout.gcp-us-central1.svc.cluster.local:8080
+    jurisdiction: US
+    gridZone: US-MIDW-MISO
+    tier: primary
+    capacityRps: 300
+    enabled: true
+  - id: azure-francecentral
+    cloud: azure
+    region: francecentral
+    displayName: Azure Paris
+    address: http://checkout.azure-francecentral.svc.cluster.local:8080
+    jurisdiction: EU
+    gridZone: FR
+    tier: primary
+    capacityRps: 250
+    enabled: true
+
+# Objectives are relative weights, normalised to sum to one before scoring.
+# latencySloMs is the p95 the blended route must hold; when the cheapest blend
+# would breach it, the router sheds the slowest candidates until it fits.
+# temperature controls how sharply score differences become traffic share —
+# near zero is winner-take-all, larger values spread traffic.
+#
+# A route matching "/" is required; without one, any path outside every prefix
+# would be denied for want of a route.
+routes:
+  - id: payments
+    displayName: Payments API
+    pathPrefix: /api/payments
+    objectives: { cost: 0.05, latency: 0.45, carbon: 0.05, reliability: 0.45 }
+    latencySloMs: 45
+    temperature: 0.08
+    requireMtls: true
+  - id: interactive
+    displayName: Interactive API
+    pathPrefix: /api/v1
+    objectives: { cost: 0.15, latency: 0.55, carbon: 0.15, reliability: 0.15 }
+    latencySloMs: 60
+    temperature: 0.12
+  - id: batch
+    displayName: Batch & ETL
+    pathPrefix: /batch
+    objectives: { cost: 0.45, latency: 0.05, carbon: 0.40, reliability: 0.10 }
+    temperature: 0.20
+  - id: default
+    displayName: Default
+    pathPrefix: /
+    objectives: { cost: 0.35, latency: 0.35, carbon: 0.20, reliability: 0.10 }
+    latencySloMs: 120
+    temperature: 0.14
+
+router:
+  controlIntervalMs: 1000
+  temperature: 0.12
+  smoothing: 0.35
+  deadband: 0.04
+  minWeight: 0.01
+  explorationFloor: 0.02
+  defaultRequestBytes: 65536
+
+probe:
+  intervalMs: 2000
+  timeoutMs: 2000
+  path: /healthz
+
+ledger:
+  capacity: 5000
+  rollupPoints: 600
+
+pricing:
+  # Only Azure's retail price API answers without credentials.
+  live: false
+  refreshSeconds: 900
+  # Negotiated rates, keyed by backend id, in USD per GB.
+  overrides: {}
+
+carbon:
+  # Published estimates for the network energy intensity of a gigabyte span
+  # roughly 0.004 to 0.06 kWh. This mid-range default is stated explicitly so
+  # a reader can see what assumption produced the emissions figures.
+  energyKwhPerGb: 0.015
+  refreshSeconds: 60
+  # Set existingSecret to supply a live grid-intensity token without putting it
+  # in values.
+  electricityMaps:
+    existingSecret: ""
+    key: electricity-maps-token
+
+# The policy document. Deny overrides allow; at least one allow must match.
+policy: |
+  policy "deny-unauthenticated" {
+    description "Zero trust: network position is not identity."
+    priority    10
+    effect      deny
+    when        not subject.authenticated
+    message     "unauthenticated request rejected"
+  }
+
+  policy "payments-requires-mtls" {
+    priority 30
+    effect   deny
+    when     request.path startswith "/api/payments" and not subject.mtls
+    message  "payments endpoints require mutual TLS"
+  }
+
+  policy "pii-stays-in-eu" {
+    description "GDPR: personal data belonging to EU subjects must not leave the EU."
+    priority    100
+    effect      constrain
+    when        request.data_class == "pii" and subject.claims["residency"] == "eu"
+    require     backend.jurisdiction == "EU"
+    message     "GDPR residency: EU personal data may only egress to EU regions"
+  }
+
+  policy "batch-favours-cost-and-carbon" {
+    priority 210
+    effect   prefer
+    when     request.path startswith "/batch"
+    prefer   { cost: 0.45, carbon: 0.40, latency: 0.05, reliability: 0.10 }
+  }
+
+  policy "allow-mesh-workloads" {
+    priority 900
+    effect   allow
+    when     subject.authenticated and subject.trust_domain == "cluster.local"
+  }

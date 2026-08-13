@@ -1,0 +1,63 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sluice.fullname" . }}
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "sluice.selectorLabels" . | nindent 4 }}
+  ports:
+    - { name: http, port: {{ .Values.service.httpPort }}, targetPort: http, protocol: TCP }
+    - { name: authz, port: {{ .Values.service.authzPort }}, targetPort: authz, protocol: TCP }
+---
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "sluice.serviceAccountName" . }}
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+# Sluice reads no Kubernetes API objects: its topology comes from a ConfigMap
+# and its signals from the network. A component sitting in the authorisation
+# path should hold no cluster credentials it does not use.
+automountServiceAccountToken: false
+{{- end }}
+---
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "sluice.fullname" . }}
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "sluice.selectorLabels" . | nindent 6 }}
+{{- end }}
+---
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "sluice.fullname" . }}
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "sluice.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+{{- end }}

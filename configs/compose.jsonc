@@ -1,0 +1,174 @@
+// Sluice configuration for the container demo (deploy/docker-compose.yml).
+//
+// This is JSONC: // and /* */ comments are stripped before decoding. Routing
+// configuration is full of choices whose reasoning matters more than the
+// number, and plain JSON has nowhere to put that reasoning.
+//
+// Unknown keys are rejected rather than ignored, so a typo surfaces at startup
+// instead of on the bill.
+{
+  "listen": {
+    // Dashboard, REST API and /metrics.
+    "api": ":8080",
+    // Envoy calls this for every request it forwards.
+    "authz": ":8081"
+  },
+
+  // Three regions, one per cloud, chosen so no single backend wins on every
+  // objective.
+  //
+  // The relationship that matters: us-central1 is the *fastest* region and
+  // also has the most expensive egress — Google's premium tier lists at
+  // $0.12/GB against Azure's $0.087. A latency-only balancer pays that
+  // premium on every byte and never knows it did. francecentral is the
+  // cheapest and roughly six times cleaner per byte, but 88ms away, so it
+  // wins batch traffic and gets shed by the interactive SLO.
+  "backends": [
+    {
+      "id": "aws-us-east-1",
+      "cloud": "aws",
+      "region": "us-east-1",
+      "displayName": "AWS N. Virginia",
+      "address": "http://upstream-aws:8080",
+      "jurisdiction": "US",
+      "gridZone": "US-MIDA-PJM",
+      "tier": "primary",
+      "capacityRps": 400,
+      "enabled": true,
+      "labels": { "geo": "us-east" }
+    },
+    {
+      "id": "gcp-us-central1",
+      "cloud": "gcp",
+      "region": "us-central1",
+      "displayName": "Google Iowa",
+      "address": "http://upstream-gcp:8080",
+      "jurisdiction": "US",
+      "gridZone": "US-MIDW-MISO",
+      "tier": "primary",
+      "capacityRps": 300,
+      "enabled": true,
+      "labels": { "geo": "us-central" }
+    },
+    {
+      "id": "azure-francecentral",
+      "cloud": "azure",
+      "region": "francecentral",
+      "displayName": "Azure Paris",
+      "address": "http://upstream-azure:8080",
+      "jurisdiction": "EU",
+      // France runs on roughly 55 gCO2e/kWh against PJM's 355, so this region
+      // is about six times cleaner per byte than N. Virginia.
+      "gridZone": "FR",
+      "tier": "primary",
+      "capacityRps": 250,
+      "enabled": true,
+      "labels": { "geo": "eu-west" }
+    }
+  ],
+
+  "routes": [
+    {
+      "id": "payments",
+      "displayName": "Payments API",
+      "pathPrefix": "/api/payments",
+      "objectives": { "cost": 0.05, "latency": 0.45, "carbon": 0.05, "reliability": 0.45 },
+      "latencySloMs": 45,
+      // A low temperature keeps payments close to winner-take-all rather than
+      // spreading across a region that merely scores well.
+      "temperature": 0.08,
+      "requireMtls": true
+    },
+    {
+      "id": "interactive",
+      "displayName": "Interactive API",
+      "pathPrefix": "/api/v1",
+      "objectives": { "cost": 0.15, "latency": 0.55, "carbon": 0.15, "reliability": 0.15 },
+      "latencySloMs": 60,
+      "temperature": 0.12
+    },
+    {
+      "id": "batch",
+      "displayName": "Batch & ETL",
+      "pathPrefix": "/batch",
+      // No SLO: batch spends its entire latency budget buying cheaper and
+      // cleaner egress. This is where the savings on the dashboard come from.
+      "objectives": { "cost": 0.45, "latency": 0.05, "carbon": 0.40, "reliability": 0.10 },
+      "temperature": 0.20
+    },
+    {
+      // A catch-all is required; without one, any path outside every prefix
+      // would be denied for want of a route.
+      "id": "default",
+      "displayName": "Default",
+      "pathPrefix": "/",
+      "objectives": { "cost": 0.35, "latency": 0.35, "carbon": 0.20, "reliability": 0.10 },
+      "latencySloMs": 120,
+      "temperature": 0.14
+    }
+  ],
+
+  "policy": {
+    "file": "/etc/sluice/policies.sluice",
+    "cacheSize": 8192,
+    "cacheTtlSeconds": 5,
+    // Poll the file for changes. Works identically for a bind mount and a
+    // Kubernetes ConfigMap, whose updates arrive as an atomic symlink swap.
+    "watch": true
+  },
+
+  "pricing": {
+    // Only Azure's retail price API answers without credentials. The others
+    // fall back to the bundled list-price table.
+    "live": false,
+    "refreshSeconds": 900,
+    // Negotiated rates and committed-use discounts go here, keyed by backend.
+    "overrides": {}
+  },
+
+  "carbon": {
+    // Published estimates for the network energy intensity of moving a
+    // gigabyte span roughly 0.004 to 0.06 kWh depending on methodology and
+    // vintage. This is a mid-range figure, stated explicitly so a reader can
+    // see what assumption produced the emissions numbers.
+    "energyKwhPerGb": 0.015,
+    "refreshSeconds": 60
+    // "electricityMapsToken": "…"  // live grid intensity instead of the model
+  },
+
+  "router": {
+    "controlIntervalMs": 1000,
+    "temperature": 0.12,
+    // Fraction of each newly computed target folded in per cycle. Lower reacts
+    // more slowly and rewrites the data plane less often.
+    "smoothing": 0.35,
+    // How far the distribution must move before it is pushed. Safety changes
+    // — an ejection, a shed — bypass this and publish immediately.
+    "deadband": 0.04,
+    "minWeight": 0.01,
+    // Every eligible backend keeps a floor of real traffic so its latency and
+    // error signals stay honest rather than depending on synthetic probes.
+    "explorationFloor": 0.02,
+    "defaultObjectives": { "cost": 0.35, "latency": 0.35, "carbon": 0.20, "reliability": 0.10 },
+    "defaultRequestBytes": 65536
+  },
+
+  "probe": {
+    "intervalMs": 2000,
+    "timeoutMs": 2000,
+    "path": "/healthz"
+  },
+
+  "ledger": {
+    // Decisions retained with their full derivation, for the explainability
+    // view and for policy backtesting.
+    "capacity": 5000,
+    "rollupPoints": 600
+  },
+
+  "demo": {
+    // The container demo uses real upstream containers, so the in-process
+    // simulator is off. Incident injection is unavailable in this mode.
+    "enabled": false
+  }
+}

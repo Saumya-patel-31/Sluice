@@ -1,0 +1,329 @@
+# Sluice control plane on Kubernetes.
+#
+#   kubectl apply -f deploy/k8s/sluice.yaml
+#   kubectl -n sluice port-forward svc/sluice 8080:8080
+#
+# The control plane is stateless: the decision ledger and signal history are
+# in-memory and deliberately disposable, so a pod can be replaced at any time.
+# What must survive a restart — the policy document and the topology — lives in
+# ConfigMaps, and the routing distribution is rebuilt from live measurements
+# within a few control-loop ticks.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sluice
+  labels:
+    app.kubernetes.io/name: sluice
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sluice
+  namespace: sluice
+# Sluice reads no Kubernetes API objects. It gets its topology from a ConfigMap
+# and its signals from the network, so it needs no Role and no RoleBinding —
+# a component in the authorisation path should hold no cluster credentials it
+# does not use.
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sluice-config
+  namespace: sluice
+data:
+  sluice.jsonc: |
+    {
+      "listen": { "api": ":8080", "authz": ":8081" },
+      "backends": [
+        {
+          "id": "aws-us-east-1", "cloud": "aws", "region": "us-east-1",
+          "displayName": "AWS N. Virginia",
+          "address": "http://checkout.aws-us-east-1.svc.cluster.local:8080",
+          "jurisdiction": "US", "gridZone": "US-MIDA-PJM",
+          "tier": "primary", "capacityRps": 400, "enabled": true
+        },
+        {
+          "id": "gcp-us-central1", "cloud": "gcp", "region": "us-central1",
+          "displayName": "Google Iowa",
+          "address": "http://checkout.gcp-us-central1.svc.cluster.local:8080",
+          "jurisdiction": "US", "gridZone": "US-MIDW-MISO",
+          "tier": "primary", "capacityRps": 300, "enabled": true
+        },
+        {
+          "id": "azure-francecentral", "cloud": "azure", "region": "francecentral",
+          "displayName": "Azure Paris",
+          "address": "http://checkout.azure-francecentral.svc.cluster.local:8080",
+          "jurisdiction": "EU", "gridZone": "FR",
+          "tier": "primary", "capacityRps": 250, "enabled": true
+        }
+      ],
+      "routes": [
+        {
+          "id": "payments", "displayName": "Payments API", "pathPrefix": "/api/payments",
+          "objectives": { "cost": 0.05, "latency": 0.45, "carbon": 0.05, "reliability": 0.45 },
+          "latencySloMs": 45, "temperature": 0.08, "requireMtls": true
+        },
+        {
+          "id": "interactive", "displayName": "Interactive API", "pathPrefix": "/api/v1",
+          "objectives": { "cost": 0.15, "latency": 0.55, "carbon": 0.15, "reliability": 0.15 },
+          "latencySloMs": 60, "temperature": 0.12
+        },
+        {
+          "id": "batch", "displayName": "Batch & ETL", "pathPrefix": "/batch",
+          "objectives": { "cost": 0.45, "latency": 0.05, "carbon": 0.40, "reliability": 0.10 },
+          "temperature": 0.20
+        },
+        {
+          "id": "default", "displayName": "Default", "pathPrefix": "/",
+          "objectives": { "cost": 0.35, "latency": 0.35, "carbon": 0.20, "reliability": 0.10 },
+          "latencySloMs": 120, "temperature": 0.14
+        }
+      ],
+      "policy": { "file": "/etc/sluice/policies.sluice", "watch": true },
+      "pricing": { "live": false, "refreshSeconds": 900 },
+      "carbon": { "energyKwhPerGb": 0.015, "refreshSeconds": 60 },
+      "router": {
+        "controlIntervalMs": 1000, "temperature": 0.12, "smoothing": 0.35,
+        "deadband": 0.04, "minWeight": 0.01, "explorationFloor": 0.02
+      },
+      "probe": { "intervalMs": 2000, "timeoutMs": 2000, "path": "/healthz" },
+      "ledger": { "capacity": 5000, "rollupPoints": 600 },
+      "demo": { "enabled": false }
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sluice-policy
+  namespace: sluice
+data:
+  # Edited in place with `kubectl edit configmap sluice-policy`. Sluice polls
+  # the mounted file and reloads it; a document that fails to compile is
+  # rejected and the previous set keeps serving, so a typo cannot disarm the
+  # policy engine.
+  policies.sluice: |
+    policy "deny-unauthenticated" {
+      description "Zero trust: network position is not identity."
+      priority    10
+      effect      deny
+      when        not subject.authenticated
+      message     "unauthenticated request rejected"
+    }
+
+    policy "deny-untrusted-domain" {
+      priority 20
+      effect   deny
+      when     subject.authenticated and subject.trust_domain != "cluster.local"
+      message  "unrecognised trust domain"
+    }
+
+    policy "payments-requires-mtls" {
+      priority 30
+      effect   deny
+      when     request.path startswith "/api/payments" and not subject.mtls
+      message  "payments endpoints require mutual TLS"
+    }
+
+    policy "pii-stays-in-eu" {
+      description "GDPR: personal data belonging to EU subjects must not leave the EU."
+      priority    100
+      effect      constrain
+      when        request.data_class == "pii" and subject.claims["residency"] == "eu"
+      require     backend.jurisdiction == "EU"
+      message     "GDPR residency: EU personal data may only egress to EU regions"
+    }
+
+    policy "batch-favours-cost-and-carbon" {
+      priority 210
+      effect   prefer
+      when     request.path startswith "/batch"
+      prefer   { cost: 0.45, carbon: 0.40, latency: 0.05, reliability: 0.10 }
+    }
+
+    policy "allow-mesh-workloads" {
+      priority 900
+      effect   allow
+      when     subject.authenticated and subject.trust_domain == "cluster.local"
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sluice
+  namespace: sluice
+  labels:
+    app.kubernetes.io/name: sluice
+    app.kubernetes.io/component: control-plane
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sluice
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sluice
+        app.kubernetes.io/component: control-plane
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: sluice
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      # Spread replicas across nodes. Both replicas landing on one node would
+      # make a single node drain take the authorisation path with it.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: sluice
+      containers:
+        - name: sluiced
+          image: ghcr.io/saumyapatel/sluice:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config=/etc/sluice/sluice.jsonc
+            - --log-level=info
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: authz, containerPort: 8081 }
+          env:
+            # Live grid intensity, if a token is provisioned. Without it Sluice
+            # uses its bundled zone dataset shaped by a diurnal model.
+            - name: SLUICE_ELECTRICITY_MAPS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sluice-secrets
+                  key: electricity-maps-token
+                  optional: true
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            # The ledger and signal history are the memory floor and are bounded
+            # by configuration, so the limit is a real ceiling rather than a guess.
+            limits: { cpu: "1", memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          # Liveness only checks the process is serving. Readiness additionally
+          # requires a computed traffic distribution: before the first control
+          # loop completes the router would deny everything for want of a plan,
+          # and a pod in that state must not receive authorisation traffic.
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 2
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 15
+          volumeMounts:
+            - { name: config, mountPath: /etc/sluice/sluice.jsonc, subPath: sluice.jsonc, readOnly: true }
+            - { name: policy, mountPath: /etc/sluice/policies.sluice, subPath: policies.sluice, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: config, configMap: { name: sluice-config } }
+        - { name: policy, configMap: { name: sluice-policy } }
+        - { name: tmp, emptyDir: {} }
+      # Long enough for in-flight authorisations to finish. Envoy fails closed,
+      # so cutting a pod mid-decision turns into refused requests.
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sluice
+  namespace: sluice
+  labels:
+    app.kubernetes.io/name: sluice
+spec:
+  selector:
+    app.kubernetes.io/name: sluice
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+    - { name: authz, port: 8081, targetPort: authz }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sluice
+  namespace: sluice
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sluice
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sluice
+  namespace: sluice
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: sluice
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # Any namespace may reach the ext_authz port — that is the whole mesh
+    # asking permission. The dashboard and API are reachable on 8080 the same
+    # way; put an ingress with authentication in front of it in production.
+    - ports:
+        - { protocol: TCP, port: 8080 }
+        - { protocol: TCP, port: 8081 }
+  egress:
+    # Health probes to upstream regions.
+    - ports:
+        - { protocol: TCP, port: 8080 }
+        - { protocol: TCP, port: 8443 }
+    # DNS.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Provider pricing and grid-intensity APIs, when live signals are enabled.
+    - ports:
+        - { protocol: TCP, port: 443 }
+---
+# Requires the Prometheus Operator. Without it, the pod annotations above are
+# enough for a scrape-config-based Prometheus.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: sluice
+  namespace: sluice
+  labels:
+    app.kubernetes.io/name: sluice
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sluice
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

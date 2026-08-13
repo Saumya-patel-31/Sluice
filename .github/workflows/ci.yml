@@ -1,0 +1,153 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26"
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Verify formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "these files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # The race detector needs a 64-bit C toolchain, which is why this runs
+      # on Linux. The control plane is heavily concurrent — a control loop
+      # swapping state under a request path, a ledger fanning out to
+      # subscribers, sharded caches — so this is the check that matters most.
+      - name: Test with the race detector
+        run: go test -race -count=2 ./...
+
+      - name: Coverage
+        run: |
+          go test -coverprofile=coverage.out -covermode=atomic ./...
+          go tool cover -func=coverage.out | tail -n 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Cross-compile
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_SHA::8}" ./...
+
+  policy:
+    name: policy compiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # Start the control plane against the demo topology, let it accumulate
+      # some traffic, then backtest the shipped policy document against it.
+      # `sluicectl policy test` exits non-zero when traffic that flows today
+      # would be refused, which makes this a real gate rather than a syntax
+      # check.
+      - name: Backtest the shipped policy document
+        run: |
+          go run ./cmd/sluiced --demo --listen :8080 --log-level warn &
+          SLUICED=$!
+          trap 'kill $SLUICED' EXIT
+
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/readyz >/dev/null; then break; fi
+            sleep 1
+          done
+          sleep 10   # let the ledger fill
+
+          go run ./cmd/sluicectl --addr http://localhost:8080 status
+          go run ./cmd/sluicectl --addr http://localhost:8080 backends
+          go run ./cmd/sluicectl --addr http://localhost:8080 policy test configs/policies.sluice
+
+  docker:
+    name: image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: sluice:ci
+          build-args: |
+            VERSION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the image
+        run: |
+          docker run -d --name sluice -p 8080:8080 sluice:ci --demo
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/readyz >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf http://localhost:8080/api/status | head -c 400; echo
+          # The exposition must actually contain series, not just parse.
+          curl -sf http://localhost:8080/metrics | grep -q '^sluice_decisions_total'
+          docker rm -f sluice
+
+  helm:
+    name: chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+
+      - name: Lint and render
+        run: |
+          helm lint deploy/helm/sluice
+          helm template sluice deploy/helm/sluice > /dev/null
+          helm template sluice deploy/helm/sluice --set serviceMonitor.enabled=true > /dev/null

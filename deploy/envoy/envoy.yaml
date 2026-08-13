@@ -1,0 +1,239 @@
+# Envoy configuration for a Sluice data plane.
+#
+# The whole integration is one ext_authz filter and a header-matched route
+# table. There is no custom Envoy filter to build, no WASM module to ship and
+# no xDS server to operate: Sluice answers an ordinary HTTP call, returns the
+# destination as a response header, and Envoy's own route table does the rest.
+#
+# Request flow:
+#   1. Envoy calls Sluice's /api ext_authz endpoint before forwarding.
+#   2. Sluice authorises the request and picks a backend from the traffic
+#      distribution its control loop computed.
+#   3. Sluice answers 200 with x-sluice-backend: <id>.
+#   4. Envoy appends that header, clears its route cache, and re-matches.
+#   5. The route table sends the request to the cluster with that name.
+#
+# Step 4 is the load-bearing one. Envoy clears the route cache when ext_authz
+# appends upstream headers, which is what allows an authorisation response to
+# change the routing decision. Without it the header would arrive upstream but
+# the route would already have been chosen.
+
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: edge
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: sluice_edge
+                codec_type: AUTO
+                use_remote_address: true
+                # Trust exactly one hop of X-Forwarded-For. Sluice's CIDR
+                # policies key off the resulting address, so a larger number
+                # here would let a caller present itself as coming from the
+                # corporate range.
+                xff_num_trusted_hops: 0
+
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        json_format:
+                          time: "%START_TIME%"
+                          method: "%REQ(:METHOD)%"
+                          path: "%REQ(:PATH)%"
+                          status: "%RESPONSE_CODE%"
+                          duration_ms: "%DURATION%"
+                          bytes: "%BYTES_SENT%"
+                          # These come back from Sluice, which makes an Envoy
+                          # access log joinable against the decision ledger.
+                          backend: "%REQ(X-SLUICE-BACKEND)%"
+                          cloud: "%REQ(X-SLUICE-CLOUD)%"
+                          decision: "%REQ(X-SLUICE-DECISION)%"
+                          deny_reason: "%RESP(X-SLUICE-DENY-REASON)%"
+                          flags: "%RESPONSE_FLAGS%"
+
+                route_config:
+                  name: sluice_routes
+                  virtual_hosts:
+                    - name: all
+                      domains: ["*"]
+                      routes:
+                        # One route per backend, matched on the header the
+                        # authorisation response set. Adding a region means
+                        # adding a cluster and a route here; the routing
+                        # decision itself stays entirely in the control plane.
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: x-sluice-backend
+                                string_match: { exact: aws-us-east-1 }
+                          route:
+                            cluster: aws-us-east-1
+                            timeout: 15s
+                            retry_policy:
+                              retry_on: "5xx,reset,connect-failure"
+                              num_retries: 1
+
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: x-sluice-backend
+                                string_match: { exact: gcp-us-central1 }
+                          route:
+                            cluster: gcp-us-central1
+                            timeout: 15s
+                            retry_policy:
+                              retry_on: "5xx,reset,connect-failure"
+                              num_retries: 1
+
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: x-sluice-backend
+                                string_match: { exact: azure-francecentral }
+                          route:
+                            cluster: azure-francecentral
+                            timeout: 15s
+                            retry_policy:
+                              retry_on: "5xx,reset,connect-failure"
+                              num_retries: 1
+
+                        # Reaching here means authorisation succeeded but named
+                        # a backend with no cluster — a configuration drift
+                        # between Sluice and Envoy. Failing loudly beats
+                        # silently routing somewhere unintended.
+                        - match: { prefix: "/" }
+                          direct_response:
+                            status: 503
+                            body:
+                              inline_string: "sluice: no cluster matches the selected backend\n"
+
+                http_filters:
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      transport_api_version: V3
+                      # Fail closed. An authorisation service that cannot be
+                      # reached has not authorised anything, and a router that
+                      # admits traffic when its policy engine is down is not a
+                      # zero-trust router.
+                      failure_mode_allow: false
+                      # Decisions take tens of microseconds; a quarter second
+                      # is generous and bounds the blast radius of a stall.
+                      http_service:
+                        server_uri:
+                          uri: http://sluiced:8081
+                          cluster: sluice_authz
+                          timeout: 0.25s
+                        authorization_request:
+                          allowed_headers:
+                            patterns:
+                              # The caller's verified identity, set by the mesh
+                              # sidecar or by this listener's TLS context.
+                              - exact: x-forwarded-client-cert
+                              - exact: authorization
+                              # Hints about the request. These are caller
+                              # assertions, but the worst a liar achieves is
+                              # stricter routing for their own traffic.
+                              - exact: x-sluice-data-class
+                              - exact: x-sluice-bytes
+                              - exact: x-sluice-geo
+                              - exact: content-length
+                              - prefix: x-envoy-
+                          headers_to_add:
+                            - key: x-sluice-via
+                              value: envoy
+                        authorization_response:
+                          # Everything Sluice decided travels upstream, which
+                          # is also what triggers the route cache clear.
+                          allowed_upstream_headers:
+                            patterns:
+                              - prefix: x-sluice-
+                          # On a refusal the client learns why, which is the
+                          # difference between a debuggable 403 and a mystery.
+                          allowed_client_headers:
+                            patterns:
+                              - exact: x-sluice-deny-reason
+                              - exact: x-sluice-decision
+
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: sluice_authz
+      type: STRICT_DNS
+      connect_timeout: 1s
+      lb_policy: ROUND_ROBIN
+      # Keep connections warm: a TCP handshake per authorisation would dominate
+      # the decision's own cost by an order of magnitude.
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http_protocol_options: {}
+      load_assignment:
+        cluster_name: sluice_authz
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: sluiced, port_value: 8081 }
+      health_checks:
+        - timeout: 1s
+          interval: 5s
+          unhealthy_threshold: 3
+          healthy_threshold: 1
+          http_health_check: { path: /healthz }
+
+    # Upstream regions. Outlier detection is deliberately conservative here:
+    # Sluice's own circuit breakers already eject failing backends from the
+    # distribution, and two ejection mechanisms racing each other produce
+    # traffic patterns nobody can explain afterwards. Envoy's job is to catch
+    # a host failing faster than the control loop's one-second cadence.
+    - &region
+      name: aws-us-east-1
+      type: STRICT_DNS
+      connect_timeout: 2s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: aws-us-east-1
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: upstream-aws, port_value: 8080 }
+      outlier_detection:
+        consecutive_5xx: 8
+        interval: 10s
+        base_ejection_time: 15s
+        max_ejection_percent: 50
+
+    - <<: *region
+      name: gcp-us-central1
+      load_assignment:
+        cluster_name: gcp-us-central1
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: upstream-gcp, port_value: 8080 }
+
+    - <<: *region
+      name: azure-francecentral
+      load_assignment:
+        cluster_name: azure-francecentral
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: upstream-azure, port_value: 8080 }

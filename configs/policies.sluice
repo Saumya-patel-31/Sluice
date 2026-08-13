@@ -1,0 +1,146 @@
+# Sluice policy document.
+#
+# Semantics
+#   - deny always wins, whatever its priority
+#   - at least one allow must match, or the request is refused
+#   - constrain prunes destinations without affecting authorisation
+#   - prefer reshapes the routing objectives for matching traffic
+#   - any evaluation error denies the request
+#
+# Priority orders evaluation (ascending), which controls how the trace reads
+# and which `prefer` block wins when several match. It does not let an allow
+# outrank a deny.
+#
+# Attributes  subject.*  request.*  backend.*  time.*
+# Operators   == != < <= > >= and or not in "not in" matches startswith endswith contains
+# Functions   lower upper len has ip_in_cidr split
+#
+# `matches` is a glob, not a regular expression. This runs on every request,
+# and an operator-authored regex is an operator-authored denial of service.
+
+# ── Baseline: who may transit at all ─────────────────────────────────────────
+
+policy "deny-unauthenticated" {
+  description "Zero trust: network position is not identity."
+  priority    10
+  effect      deny
+  when        not subject.authenticated
+  message     "unauthenticated request rejected"
+  tags        ["baseline", "zero-trust"]
+}
+
+policy "deny-untrusted-domain" {
+  description "Only workloads from a known SPIFFE trust domain may transit."
+  priority    20
+  effect      deny
+  when        subject.authenticated and subject.trust_domain not in ["prod.internal", "staging.internal"]
+  message     "unrecognised trust domain"
+  tags        ["baseline", "zero-trust"]
+}
+
+policy "payments-requires-mtls" {
+  description "A bearer token is not sufficient to move money."
+  priority    30
+  effect      deny
+  when        request.path startswith "/api/payments" and not subject.mtls
+  message     "payments endpoints require mutual TLS"
+  tags        ["pci"]
+}
+
+policy "admin-from-corp-only" {
+  description "The administrative surface is reachable only from corporate ranges."
+  priority    40
+  effect      deny
+  when        request.path startswith "/admin" and not ip_in_cidr(request.source_ip, "10.0.0.0/8")
+  message     "administrative endpoints are restricted to the corporate network"
+  tags        ["baseline"]
+}
+
+policy "staging-may-not-touch-production-data" {
+  description "A canary in staging must never reach real personal data."
+  priority    50
+  effect      deny
+  when        subject.trust_domain == "staging.internal" and request.data_class in ["pii", "regulated"]
+  message     "staging identities may not access production personal data"
+  tags        ["baseline", "gdpr"]
+}
+
+# ── Residency: where the data may land ───────────────────────────────────────
+
+policy "pii-stays-in-eu" {
+  description "GDPR: personal data belonging to EU subjects must not leave the EU."
+  priority    100
+  effect      constrain
+  when        request.data_class == "pii" and subject.claims["residency"] == "eu"
+  require     backend.jurisdiction == "EU"
+  message     "GDPR residency: EU personal data may only egress to EU regions"
+  tags        ["gdpr", "residency"]
+}
+
+policy "india-data-stays-in-india" {
+  description "DPDP Act: local storage requirement for Indian personal data."
+  priority    105
+  effect      constrain
+  when        request.data_class == "pii" and subject.claims["residency"] == "in"
+  require     backend.jurisdiction == "IN"
+  message     "DPDP residency: Indian personal data may only egress to Indian regions"
+  tags        ["residency"]
+}
+
+policy "regulated-workloads-avoid-burst-tier" {
+  description "Regulated traffic may not land on opportunistic burst capacity."
+  priority    110
+  effect      constrain
+  when        request.data_class == "regulated"
+  require     backend.tier == "primary"
+  message     "regulated traffic is restricted to primary-tier capacity"
+  tags        ["compliance"]
+}
+
+# ── Objectives: what each class of traffic optimises for ─────────────────────
+
+policy "interactive-traffic-favours-latency" {
+  description "Someone is waiting on these, so latency dominates and the savings come from elsewhere."
+  priority    200
+  effect      prefer
+  when        request.path startswith "/api/v1/feed" or request.path startswith "/api/v1/search"
+  prefer      { latency: 0.70, reliability: 0.20, cost: 0.07, carbon: 0.03 }
+  tags        ["slo"]
+}
+
+policy "payments-favours-reliability" {
+  description "Egress cost on an authorisation is rounding error next to a timeout."
+  priority    205
+  effect      prefer
+  when        request.path startswith "/api/payments"
+  prefer      { reliability: 0.50, latency: 0.44, cost: 0.03, carbon: 0.03 }
+  tags        ["pci", "slo"]
+}
+
+policy "batch-traffic-favours-cost-and-carbon" {
+  description "Nothing is waiting on async work, so spend the latency budget."
+  priority    210
+  effect      prefer
+  when        request.path startswith "/batch" or subject.service == "etl"
+  prefer      { cost: 0.45, carbon: 0.40, latency: 0.05, reliability: 0.10 }
+  tags        ["cost", "carbon"]
+}
+
+policy "overnight-batch-chases-clean-grids" {
+  description "Off-peak batch weights carbon hardest; the grid is cleanest and nobody is waiting."
+  priority    220
+  effect      prefer
+  when        request.path startswith "/batch" and (time.hour < 6 or time.hour >= 22)
+  prefer      { carbon: 0.60, cost: 0.30, latency: 0.02, reliability: 0.08 }
+  tags        ["carbon"]
+}
+
+# ── The allow ────────────────────────────────────────────────────────────────
+
+policy "allow-mesh-workloads" {
+  description "Authenticated workloads from a trusted domain may transit."
+  priority    900
+  effect      allow
+  when        subject.authenticated and subject.trust_domain in ["prod.internal", "staging.internal"]
+  tags        ["baseline"]
+}

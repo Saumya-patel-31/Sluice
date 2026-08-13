@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Sluice · zero-trust multi-cloud router</title>
+<meta name="description" content="Live control plane for cost-, carbon- and latency-aware zero-trust traffic routing across AWS, GCP and Azure.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<a class="skip-link" href="#view">Skip to content</a>
+
+<div class="shell">
+
+  <!-- ── Rail ─────────────────────────────────────────────────────────── -->
+  <nav class="rail" aria-label="Primary">
+    <div class="rail__brand">
+      <svg class="rail__mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+        <path d="M4 7h24M4 16h24M4 25h24" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" opacity=".25"/>
+        <path d="M4 7h11M4 16h20M4 25h7" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+        <circle cx="24" cy="7" r="2.5" fill="currentColor"/>
+        <circle cx="16" cy="25" r="2.5" fill="currentColor"/>
+      </svg>
+      <div class="rail__brandtext">
+        <span class="rail__name">Sluice</span>
+        <span class="rail__tag">traffic control</span>
+      </div>
+    </div>
+
+    <ul class="rail__nav" role="list">
+      <li><a class="navitem" href="#/overview"   data-view="overview"><span class="navitem__icon" data-icon="gauge"></span><span class="navitem__label">Overview</span></a></li>
+      <li><a class="navitem" href="#/topology"   data-view="topology"><span class="navitem__icon" data-icon="network"></span><span class="navitem__label">Topology</span></a></li>
+      <li><a class="navitem" href="#/decisions"  data-view="decisions"><span class="navitem__icon" data-icon="list"></span><span class="navitem__label">Decisions</span></a></li>
+      <li><a class="navitem" href="#/policy"     data-view="policy"><span class="navitem__icon" data-icon="shield"></span><span class="navitem__label">Policy</span></a></li>
+      <li><a class="navitem" href="#/signals"    data-view="signals"><span class="navitem__icon" data-icon="activity"></span><span class="navitem__label">Signals</span></a></li>
+    </ul>
+
+    <div class="rail__foot">
+      <div class="rail__stat"><span class="rail__statlabel">Policy</span><code id="rail-policy-hash" class="mono">—</code></div>
+      <div class="rail__stat"><span class="rail__statlabel">Uptime</span><span id="rail-uptime" class="mono">—</span></div>
+    </div>
+  </nav>
+
+  <!-- ── Main ─────────────────────────────────────────────────────────── -->
+  <div class="main">
+
+    <header class="topbar">
+      <div class="topbar__left">
+        <h1 class="topbar__title" id="view-title">Overview</h1>
+        <p class="topbar__sub" id="view-sub">Live routing across three clouds</p>
+      </div>
+
+      <div class="topbar__right">
+        <div class="chipgroup" id="alert-chips" aria-live="polite"></div>
+        <div class="conn" id="conn" data-state="connecting">
+          <span class="conn__dot" aria-hidden="true"></span>
+          <span class="conn__label">connecting</span>
+        </div>
+      </div>
+    </header>
+
+    <main id="view" class="view" tabindex="-1">
+
+      <!-- Overview -->
+      <section class="page" data-page="overview" hidden>
+        <div class="kpis" id="kpis"></div>
+
+        <div class="grid grid--overview">
+          <article class="card card--span2">
+            <header class="card__head">
+              <div>
+                <h2 class="card__title">Traffic by cloud</h2>
+                <p class="card__sub">Requests per second, stacked. Sampled once per control-loop tick.</p>
+              </div>
+              <div class="legend" id="stream-legend"></div>
+            </header>
+            <div class="card__body card__body--chart">
+              <canvas id="stream-chart" role="img" aria-label="Stacked area chart of requests per second by cloud provider"></canvas>
+            </div>
+            <details class="card__table">
+              <summary>Show as table</summary>
+              <div class="tablewrap"><table id="stream-table" class="table table--compact"></table></div>
+            </details>
+          </article>
+
+          <article class="card">
+            <header class="card__head">
+              <div>
+                <h2 class="card__title">Objective profile</h2>
+                <p class="card__sub">Lower is better on every axis, normalised across the fleet.</p>
+              </div>
+            </header>
+            <div class="card__body">
+              <div id="radar" class="radar"></div>
+            </div>
+          </article>
+
+          <article class="card card--span2">
+            <header class="card__head">
+              <div>
+                <h2 class="card__title">Current allocation</h2>
+                <p class="card__sub">Traffic share per route, after policy, SLO and breaker constraints.</p>
+              </div>
+              <div class="seg" id="route-picker" role="tablist" aria-label="Route"></div>
+            </header>
+            <div class="card__body">
+              <div id="allocation"></div>
+            </div>
+          </article>
+
+          <article class="card">
+            <header class="card__head">
+              <div>
+                <h2 class="card__title">Decision feed</h2>
+                <p class="card__sub">Live sample. Click a row for the full derivation.</p>
+              </div>
+            </header>
+            <div class="card__body card__body--flush">
+              <ul class="feed" id="feed" role="list"></ul>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <!-- Topology -->
+      <section class="page" data-page="topology" hidden>
+        <div class="toolbar">
+          <div class="seg" id="topology-route" role="tablist" aria-label="Route"></div>
+          <div class="seg" id="topology-overlay" role="tablist" aria-label="Overlay">
+            <button class="seg__btn is-active" data-overlay="traffic" role="tab" aria-selected="true">Traffic</button>
+            <button class="seg__btn" data-overlay="carbon" role="tab" aria-selected="false">Carbon</button>
+            <button class="seg__btn" data-overlay="cost" role="tab" aria-selected="false">Cost</button>
+            <button class="seg__btn" data-overlay="latency" role="tab" aria-selected="false">Latency</button>
+          </div>
+        </div>
+        <article class="card card--fill">
+          <div class="card__body card__body--canvas">
+            <canvas id="topo-canvas" role="img" aria-label="Routing topology from the gateway through each cloud to its regions"></canvas>
+            <div class="topo-tip" id="topo-tip" hidden></div>
+          </div>
+        </article>
+        <details class="card card--table">
+          <summary class="card__summary">Adjacency table (accessible alternative to the diagram)</summary>
+          <div class="tablewrap"><table id="topo-table" class="table"></table></div>
+        </details>
+      </section>
+
+      <!-- Decisions -->
+      <section class="page" data-page="decisions" hidden>
+        <div class="toolbar toolbar--filters">
+          <div class="field">
+            <label for="f-verdict">Verdict</label>
+            <select id="f-verdict">
+              <option value="">All</option>
+              <option value="allow">Allowed</option>
+              <option value="deny">Denied</option>
+              <option value="no_capacity">No capacity</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="f-cloud">Cloud</label>
+            <select id="f-cloud"><option value="">All</option></select>
+          </div>
+          <div class="field">
+            <label for="f-route">Route</label>
+            <select id="f-route"><option value="">All</option></select>
+          </div>
+          <div class="field field--grow">
+            <label for="f-subject">Subject or path contains</label>
+            <input id="f-subject" type="search" placeholder="payments, /batch, spiffe://…" autocomplete="off">
+          </div>
+          <button class="btn" id="f-apply" type="button">Apply</button>
+          <label class="switch">
+            <input type="checkbox" id="f-live" checked>
+            <span class="switch__track" aria-hidden="true"></span>
+            <span>Live</span>
+          </label>
+        </div>
+
+        <div class="split">
+          <article class="card card--list">
+            <div class="tablewrap tablewrap--tall">
+              <table class="table table--rows" id="decisions-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Time</th>
+                    <th scope="col">Verdict</th>
+                    <th scope="col">Subject</th>
+                    <th scope="col">Path</th>
+                    <th scope="col">Destination</th>
+                    <th scope="col" class="num">Saved</th>
+                    <th scope="col" class="num">Δp95</th>
+                    <th scope="col" class="num">µs</th>
+                  </tr>
+                </thead>
+                <tbody id="decisions-body"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <aside class="card card--detail" id="decision-detail" aria-live="polite">
+            <div class="empty">
+              <span class="empty__icon" data-icon="pointer"></span>
+              <p>Select a decision to see exactly why it was routed the way it was.</p>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <!-- Policy -->
+      <section class="page" data-page="policy" hidden>
+        <div class="split split--policy">
+          <article class="card card--editor">
+            <header class="card__head">
+              <div>
+                <h2 class="card__title">Policy document</h2>
+                <p class="card__sub">Deny overrides allow. At least one allow must match, or the request is refused.</p>
+              </div>
+              <div class="card__actions">
+                <button class="btn" id="policy-backtest" type="button">Backtest</button>
+                <button class="btn btn--primary" id="policy-apply" type="button">Apply</button>
+              </div>
+            </header>
+            <div class="editor">
+              <div class="editor__gutter" id="policy-gutter" aria-hidden="true"></div>
+              <div class="editor__stack">
+                <pre class="editor__highlight" id="policy-highlight" aria-hidden="true"></pre>
+                <textarea class="editor__input" id="policy-source" spellcheck="false"
+                          autocomplete="off" autocapitalize="off" autocorrect="off"
+                          aria-label="Policy document source"></textarea>
+              </div>
+            </div>
+            <footer class="editor__foot">
+              <span id="policy-status" class="status" role="status"></span>
+            </footer>
+          </article>
+
+          <aside class="card card--reference">
+            <div class="tabs" role="tablist" aria-label="Policy panel">
+              <button class="tabs__btn is-active" data-tab="backtest" role="tab" aria-selected="true">Backtest</button>
+              <button class="tabs__btn" data-tab="rules" role="tab" aria-selected="false">Rules</button>
+              <button class="tabs__btn" data-tab="reference" role="tab" aria-selected="false">Reference</button>
+            </div>
+            <div class="card__body card__body--scroll">
+              <div data-tabpanel="backtest" id="policy-backtest-panel">
+                <div class="empty">
+                  <span class="empty__icon" data-icon="flask"></span>
+                  <p>Replay retained decisions through your edits before applying them.</p>
+                </div>
+              </div>
+              <div data-tabpanel="rules" id="policy-rules-panel" hidden></div>
+              <div data-tabpanel="reference" id="policy-reference-panel" hidden></div>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <!-- Signals -->
+      <section class="page" data-page="signals" hidden>
+        <div class="grid grid--signals" id="signal-cards"></div>
+        <article class="card">
+          <header class="card__head">
+            <div>
+              <h2 class="card__title">Provenance</h2>
+              <p class="card__sub">Where each number came from and how old it is. A decision made on a stale quote is a different claim than one made on a live reading.</p>
+            </div>
+          </header>
+          <div class="tablewrap"><table class="table" id="provenance-table"></table></div>
+        </article>
+      </section>
+
+    </main>
+  </div>
+</div>
+
+<!-- Incident console: only rendered when the control plane runs in demo mode -->
+<div class="console" id="console" hidden>
+  <button class="console__toggle" id="console-toggle" type="button" aria-expanded="false" aria-controls="console-body">
+    <span class="console__icon" data-icon="zap"></span>
+    <span>Inject incident</span>
+  </button>
+  <div class="console__body" id="console-body" hidden>
+    <div class="field">
+      <label for="inc-backend">Region</label>
+      <select id="inc-backend"></select>
+    </div>
+    <div class="field">
+      <label for="inc-kind">Fault</label>
+      <select id="inc-kind">
+        <option value="brownout">Brownout — latency degrades, nothing fails</option>
+        <option value="outage">Outage — upstream returns errors</option>
+        <option value="price_spike">Price spike — egress tier rolls over</option>
+        <option value="carbon_spike">Carbon spike — renewables drop out</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="inc-seconds">Duration <span id="inc-seconds-out" class="mono">60s</span></label>
+      <input id="inc-seconds" type="range" min="15" max="240" step="15" value="60">
+    </div>
+    <button class="btn btn--primary btn--block" id="inc-fire" type="button">Inject</button>
+    <ul class="console__list" id="inc-active" role="list"></ul>
+  </div>
+</div>
+
+<script type="module" src="/app.js"></script>
+<noscript>
+  <p class="noscript">The Sluice dashboard needs JavaScript. The REST API at
+  <code>/api/overview</code> and the Prometheus endpoint at <code>/metrics</code>
+  serve the same data without it.</p>
+</noscript>
+</body>
+</html>
