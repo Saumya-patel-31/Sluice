@@ -1,0 +1,17 @@
+# Provisioned so the dashboard has a working datasource on first boot rather
+# than an empty picker and a support question.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: sluice-prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Match the scrape interval so Grafana's automatic step never asks for
+      # finer resolution than the data has.
+      timeInterval: 5s
+      httpMethod: POST

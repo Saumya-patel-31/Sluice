@@ -235,6 +235,32 @@ jobs:
           # looks healthy and no traffic ever arrives.
           [ "$total" -gt 0 ] || { echo "no upstream served any request"; exit 1; }
 
+      - name: Prometheus is scraping both planes
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9090/-/ready >/dev/null && break || sleep 2
+          done
+          down=$(curl -s 'http://localhost:9090/api/v1/targets?state=active' \
+            | python3 -c 'import json,sys; print(sum(1 for t in json.load(sys.stdin)["data"]["activeTargets"] if t["health"]!="up"))')
+          [ "$down" = "0" ] || { echo "$down scrape target(s) unhealthy"; exit 1; }
+          # A malformed rule file loads as zero groups rather than failing, so
+          # assert the alerting rules are actually there.
+          groups=$(curl -s http://localhost:9090/api/v1/rules \
+            | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["data"]["groups"]))')
+          [ "$groups" -gt 0 ] || { echo "no alerting rules loaded"; exit 1; }
+          echo "targets healthy, $groups rule groups loaded"
+
+      # A panel querying a renamed metric renders an empty graph rather than
+      # failing — which looks exactly like "nothing is happening", and is
+      # silent precisely when someone is relying on it during an incident.
+      # This executes every panel query through Grafana's own datasource proxy.
+      - name: Every dashboard panel returns data
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:3000/api/health >/dev/null && break || sleep 2
+          done
+          python3 scripts/check-dashboard.py --live http://localhost:3000
+
       - name: Dump logs on failure
         if: failure()
         run: docker compose -f deploy/docker-compose.yml logs --tail=100

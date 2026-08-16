@@ -1,0 +1,43 @@
+# Prometheus configuration for the Sluice demo stack.
+#
+# The scrape interval matches the control loop's cadence. Scraping slower than
+# the router decides would alias the traffic distribution — you would see a
+# smooth line where the real one moved and moved back.
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+  external_labels:
+    environment: compose-demo
+
+rule_files:
+  - /etc/prometheus/alerts.yaml
+
+scrape_configs:
+  - job_name: sluice
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["sluiced:8080"]
+        labels:
+          service: control-plane
+    # If SLUICE_API_REQUIRE_AUTH_FOR_READS is enabled, /metrics follows the
+    # read policy and Prometheus needs the token:
+    #
+    # authorization:
+    #   type: Bearer
+    #   credentials_file: /etc/prometheus/sluice-token
+
+  - job_name: envoy
+    metrics_path: /stats/prometheus
+    static_configs:
+      - targets: ["envoy:9901"]
+        labels:
+          service: data-plane
+    # Envoy exports thousands of series. Keep the ones that say whether the
+    # integration is healthy — authorisation outcomes, upstream traffic and
+    # response flags — and drop the rest, so a demo does not need a
+    # multi-gigabyte TSDB.
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: "envoy_(http_.*ext_authz.*|cluster_upstream_rq.*|cluster_upstream_cx.*|server_.*|listener_.*downstream_cx_total)"
+        action: keep

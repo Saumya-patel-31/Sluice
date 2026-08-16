@@ -315,6 +315,25 @@ signal age, and cost and carbon deltas as separate avoided/added counters — be
 savings are signed, and a router that spends extra to hold an SLO should say so rather
 than reporting a smaller positive number.
 
+The compose stack brings up Prometheus and Grafana with a dashboard provisioned against
+those series — **[http://localhost:3000/d/sluice-overview](http://localhost:3000/d/sluice-overview)**,
+no login. Thirty panels across six rows: the fleet at a glance, where traffic is going,
+*the trade being made* (cost and carbon avoided versus added, and the latency paid for
+them), SLO and breaker health, the raw signals, and control-plane cost.
+
+Alerting and recording rules for the same series are in
+[`deploy/prometheus/alerts.yaml`](deploy/prometheus/alerts.yaml), and every alert has a
+documented response in the [runbook](docs/RUNBOOK.md).
+
+```bash
+make dashboard-lint                                  # static: do the queries name real metrics?
+python3 scripts/check-dashboard.py --live http://localhost:3000   # live: do they return data?
+```
+
+That second check exists because a panel querying a renamed metric does not fail — it
+renders an empty graph, which is indistinguishable from "nothing is happening" and is
+silent exactly when someone is depending on it. CI runs both.
+
 The exposition format is implemented directly rather than pulled in as a dependency.
 Sluice has **zero third-party Go modules**, which for a component sitting in the
 authorisation path of every request is worth more than the convenience.

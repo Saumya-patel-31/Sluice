@@ -9,6 +9,80 @@ finding that comes back.
 
 ---
 
+## Pass 3 — observability that can be checked
+
+**Date:** 2026-08-16
+**Posture before:** the project exported 34 metric series and shipped 15 alerting
+rules, with nothing to look at them through. Neither the metrics nor the rules
+had ever been run against a real Prometheus.
+
+### SLU-201 · Grafana dashboard, verified end to end
+
+Thirty panels across six rows, built against metric names scraped from a
+running instance rather than assumed. The rows follow the argument the product
+makes: the fleet at a glance, where traffic is going, **the trade being made**,
+SLO and health, the raw signals, and control-plane cost.
+
+The trade row is the one worth having. Cost avoided and cost added are separate
+series rather than a netted figure, so "we are spending money to buy carbon" is
+visible rather than hidden inside a smaller positive number — and the latency
+paid for those savings sits beside them.
+
+Prometheus and Grafana are now part of the compose stack, provisioned so the
+datasource and dashboard exist on first boot rather than being an exercise for
+the reader.
+
+**Verified against the running stack:** both scrape targets healthy, 15 rule
+groups loaded (which also proves the shipped alert PromQL parses — it never had
+been), and **all 30 panel queries executed through Grafana's own datasource
+proxy, every one returning data**. None empty, none rejected.
+
+### SLU-202 · A dashboard that silently shows nothing
+
+**Severity: moderate, and specific to observability assets.** A panel querying a
+metric that has been renamed does not error. It renders an empty graph, which is
+indistinguishable from "nothing is happening" — and it is silent precisely when
+somebody is relying on it during an incident.
+
+**Fixed:** `scripts/check-dashboard.py`, in two modes.
+
+- *Static*: extracts every metric name from every PromQL expression and
+  compares against the registrations in `internal/app/metrics.go`. Renaming a
+  metric now breaks the build rather than the dashboard. It also reports
+  histograms queried without a `_bucket`/`_sum`/`_count` suffix, which return
+  nothing, and lists exported metrics that no panel shows.
+- *Live* (`--live`): executes every panel expression through Grafana's
+  datasource proxy — the same path the panels use — and reports any query that
+  is rejected or returns no series.
+
+Both run in CI against the real stack.
+
+The static check immediately earned itself: it found that
+`sluice_backend_error_rate` had no panel. That is one of the four objectives
+the router scores on, so its absence was a real gap, not an oversight about a
+minor gauge. Panels for it, bytes routed, and control-loop duration were added.
+
+### SLU-203 · Grafana registered the dashboard twice
+
+**Severity: low.** `GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH` pointed at the
+same file the dashboard provider loads, so the dashboard appeared twice in
+search — once provisioned with a stable UID, once with a random one that
+changes on every restart, so any link to that copy rots.
+
+**Fixed:** dropped the env var. The provisioned copy has a fixed UID, so
+`/d/sluice-overview` is a stable address.
+
+### SLU-204 · Noisy provisioning startup
+
+**Severity: cosmetic, but it costs attention.** Grafana probes for
+`provisioning/alerting`, `provisioning/plugins` and `provisioning/notifiers`
+and logs an error for each missing one. Four errors on every boot trains a
+reader to skim past errors, which is how a real one gets missed.
+
+**Fixed:** empty directories with a `.gitkeep` explaining why they exist.
+
+---
+
 ## Pass 2 — actually deploying it
 
 **Date:** 2026-08-13
@@ -531,9 +605,7 @@ Remaining, ordered by what I would do next.
    to render without an API token — unverified until CI runs.
 3. **The race detector has never run.** The local toolchain's gcc is 32-bit
    only. It is wired into both CI and the release workflow.
-4. **No Grafana dashboard**, despite shipping the metrics and the alert rules
-   for one.
-5. **No pprof endpoint**, so a production latency regression has no profiling
+4. **No pprof endpoint**, so a production latency regression has no profiling
    path. It needs to be opt-in and behind the auth gate — an open pprof handler
    is a memory-dump endpoint.
 6. **The release workflow is written but untagged.** Multi-arch publishing,

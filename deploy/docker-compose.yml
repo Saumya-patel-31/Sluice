@@ -154,6 +154,47 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # ── Observability ──────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yaml:/etc/prometheus/alerts.yaml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      sluiced: { condition: service_healthy }
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    environment:
+      # A demo, on loopback, with no data worth protecting. A real deployment
+      # removes both of these — and note that Grafana reaching Prometheus
+      # reaching Sluice means this UI can read the fleet's cost and topology.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: dark
+      GF_LOG_LEVEL: warn
+      # Deliberately not setting GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH:
+      # pointing it at a file the dashboard provider already loads registers
+      # the dashboard twice, and the duplicate gets a random UID that changes
+      # on every restart, so any link to it rots. The provisioned copy has a
+      # stable UID instead — go straight to /d/sluice-overview.
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus: { condition: service_started }
+    restart: unless-stopped
+
   # ── Load ───────────────────────────────────────────────────────────────────
   # A trickle of authenticated traffic so the dashboard has something to show
   # without anyone having to drive it by hand. Remove this service to observe a

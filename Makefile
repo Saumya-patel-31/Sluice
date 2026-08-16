@@ -102,11 +102,19 @@ image-smoke: image ## Build the image and verify it serves
 	@echo "image smoke test passed"
 
 .PHONY: compose-up
-compose-up: ## Bring up the full stack: Envoy, three regions, control plane
+compose-up: ## Bring up the full stack: Envoy, three regions, control plane, Prometheus, Grafana
 	docker compose -f deploy/docker-compose.yml up --build -d
-	@echo "dashboard  http://localhost:8080"
-	@echo "proxy      http://localhost:10000"
-	@echo "envoy admin http://localhost:9901"
+	@echo
+	@echo "  dashboard    http://localhost:8080    Sluice's own mission-control UI"
+	@echo "  grafana      http://localhost:3000    fleet metrics over time"
+	@echo "  prometheus   http://localhost:9090"
+	@echo "  envoy admin  http://localhost:9901"
+	@echo "  proxy        https://localhost:10000  mutual TLS; see deploy/README for a curl"
+	@echo
+
+.PHONY: dashboard-lint
+dashboard-lint: ## Check the Grafana dashboard parses and every panel queries a real metric
+	@python3 scripts/check-dashboard.py
 
 .PHONY: compose-down
 compose-down: ## Tear the stack down

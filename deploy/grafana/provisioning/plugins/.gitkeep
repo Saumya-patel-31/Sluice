@@ -1,0 +1,3 @@
+# Intentionally empty. Grafana probes this directory on startup and logs an
+# error when it is absent; an empty one keeps the startup log free of noise so
+# a genuine provisioning failure is visible.
