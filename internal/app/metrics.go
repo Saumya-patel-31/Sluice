@@ -4,10 +4,10 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/model"
-	"github.com/saumyapatel/sluice/internal/router"
-	"github.com/saumyapatel/sluice/internal/signals"
-	"github.com/saumyapatel/sluice/internal/telemetry"
+	"github.com/Saumya-patel-31/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/router"
+	"github.com/Saumya-patel-31/sluice/internal/signals"
+	"github.com/Saumya-patel-31/sluice/internal/telemetry"
 )
 
 // Collector translates decisions and control-loop state into Prometheus

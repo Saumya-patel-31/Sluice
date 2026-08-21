@@ -12,10 +12,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/app"
-	"github.com/saumyapatel/sluice/internal/model"
-	"github.com/saumyapatel/sluice/internal/signals"
-	"github.com/saumyapatel/sluice/web"
+	"github.com/Saumya-patel-31/sluice/internal/app"
+	"github.com/Saumya-patel-31/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/signals"
+	"github.com/Saumya-patel-31/sluice/web"
 )
 
 // Server exposes the control plane over HTTP.

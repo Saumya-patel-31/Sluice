@@ -3,9 +3,9 @@ package api
 import (
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/model"
-	"github.com/saumyapatel/sluice/internal/signals"
-	"github.com/saumyapatel/sluice/internal/telemetry"
+	"github.com/Saumya-patel-31/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/signals"
+	"github.com/Saumya-patel-31/sluice/internal/telemetry"
 )
 
 // Status is the control plane's identity and health.

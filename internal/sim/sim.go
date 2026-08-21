@@ -24,8 +24,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/model"
-	"github.com/saumyapatel/sluice/internal/signals"
+	"github.com/Saumya-patel-31/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/signals"
 )
 
 // IncidentKind classifies a fault the operator can inject.

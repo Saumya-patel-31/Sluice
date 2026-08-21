@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/signals"
+	"github.com/Saumya-patel-31/sluice/internal/signals"
 )
 
 // Rollup keeps named aggregate time series on a fixed cadence.

@@ -14,7 +14,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/saumyapatel/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/model"
 )
 
 // SPIFFEID is a parsed SPIFFE workload identifier.

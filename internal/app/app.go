@@ -9,13 +9,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/config"
-	"github.com/saumyapatel/sluice/internal/model"
-	"github.com/saumyapatel/sluice/internal/policy"
-	"github.com/saumyapatel/sluice/internal/router"
-	"github.com/saumyapatel/sluice/internal/signals"
-	"github.com/saumyapatel/sluice/internal/sim"
-	"github.com/saumyapatel/sluice/internal/telemetry"
+	"github.com/Saumya-patel-31/sluice/internal/config"
+	"github.com/Saumya-patel-31/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/policy"
+	"github.com/Saumya-patel-31/sluice/internal/router"
+	"github.com/Saumya-patel-31/sluice/internal/signals"
+	"github.com/Saumya-patel-31/sluice/internal/sim"
+	"github.com/Saumya-patel-31/sluice/internal/telemetry"
 )
 
 // App is a fully wired control plane.

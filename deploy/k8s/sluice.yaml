@@ -198,7 +198,7 @@ spec:
               app.kubernetes.io/name: sluice
       containers:
         - name: sluiced
-          image: ghcr.io/saumyapatel/sluice:latest
+          image: ghcr.io/Saumya-patel-31/sluice:latest
           imagePullPolicy: IfNotPresent
           args:
             - --config=/etc/sluice/sluice.jsonc

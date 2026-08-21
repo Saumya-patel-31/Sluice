@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/model"
 )
 
 func TestParseSPIFFE(t *testing.T) {

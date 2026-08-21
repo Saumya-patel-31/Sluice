@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/model"
 )
 
 // PriceTableAsOf records when the bundled list prices were last transcribed

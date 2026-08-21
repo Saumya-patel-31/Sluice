@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/model"
 )
 
 // Decider is the slice of the routing engine the generator needs. Keeping it

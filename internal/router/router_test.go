@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/model"
-	"github.com/saumyapatel/sluice/internal/policy"
-	"github.com/saumyapatel/sluice/internal/signals"
+	"github.com/Saumya-patel-31/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/policy"
+	"github.com/Saumya-patel-31/sluice/internal/signals"
 )
 
 func approx(t *testing.T, got, want, tol float64, what string) {

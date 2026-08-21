@@ -26,11 +26,11 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/api"
-	"github.com/saumyapatel/sluice/internal/app"
-	"github.com/saumyapatel/sluice/internal/authz"
-	"github.com/saumyapatel/sluice/internal/config"
-	"github.com/saumyapatel/sluice/internal/proxy"
+	"github.com/Saumya-patel-31/sluice/internal/api"
+	"github.com/Saumya-patel-31/sluice/internal/app"
+	"github.com/Saumya-patel-31/sluice/internal/authz"
+	"github.com/Saumya-patel-31/sluice/internal/config"
+	"github.com/Saumya-patel-31/sluice/internal/proxy"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=…".

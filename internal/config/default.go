@@ -1,6 +1,6 @@
 package config
 
-import "github.com/saumyapatel/sluice/internal/model"
+import "github.com/Saumya-patel-31/sluice/internal/model"
 
 // Default returns the shipped configuration: a ten-region, three-cloud
 // topology chosen so that no single backend wins on every objective.

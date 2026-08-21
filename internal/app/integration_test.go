@@ -11,12 +11,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/api"
-	"github.com/saumyapatel/sluice/internal/app"
-	"github.com/saumyapatel/sluice/internal/authz"
-	"github.com/saumyapatel/sluice/internal/config"
-	"github.com/saumyapatel/sluice/internal/model"
-	"github.com/saumyapatel/sluice/internal/proxy"
+	"github.com/Saumya-patel-31/sluice/internal/api"
+	"github.com/Saumya-patel-31/sluice/internal/app"
+	"github.com/Saumya-patel-31/sluice/internal/authz"
+	"github.com/Saumya-patel-31/sluice/internal/config"
+	"github.com/Saumya-patel-31/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/proxy"
 )
 
 // The mesh identity a sidecar would present, in Envoy's forwarded-certificate

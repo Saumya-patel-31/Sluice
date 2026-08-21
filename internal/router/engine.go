@@ -14,9 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/model"
-	"github.com/saumyapatel/sluice/internal/policy"
-	"github.com/saumyapatel/sluice/internal/signals"
+	"github.com/Saumya-patel-31/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/policy"
+	"github.com/Saumya-patel-31/sluice/internal/signals"
 )
 
 // DecisionSink receives every decision the engine makes. The ledger and the

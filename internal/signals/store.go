@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/model"
 )
 
 // Quote is a single measured or published value together with its provenance.

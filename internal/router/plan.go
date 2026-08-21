@@ -5,8 +5,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/model"
-	"github.com/saumyapatel/sluice/internal/signals"
+	"github.com/Saumya-patel-31/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/signals"
 )
 
 // PlanConfig tunes how a candidate set becomes a traffic distribution.

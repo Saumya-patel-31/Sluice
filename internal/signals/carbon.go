@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/model"
 )
 
 // GridZone describes an electricity market whose carbon intensity a cloud

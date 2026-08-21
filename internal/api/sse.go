@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/model"
 )
 
 // handleStream serves the dashboard's live feed over server-sent events.

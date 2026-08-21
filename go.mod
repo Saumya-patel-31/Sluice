@@ -1,4 +1,4 @@
-module github.com/saumyapatel/sluice
+module github.com/Saumya-patel-31/sluice
 
 go 1.26
 

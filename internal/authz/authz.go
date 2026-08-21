@@ -21,9 +21,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/saumyapatel/sluice/internal/identity"
-	"github.com/saumyapatel/sluice/internal/model"
-	"github.com/saumyapatel/sluice/internal/router"
+	"github.com/Saumya-patel-31/sluice/internal/identity"
+	"github.com/Saumya-patel-31/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/router"
 )
 
 // Header names Envoy is configured to forward upstream. They are exported so

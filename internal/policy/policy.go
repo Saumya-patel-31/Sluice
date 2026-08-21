@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/model"
 )
 
 // Effect is what a policy does when its `when` clause matches.

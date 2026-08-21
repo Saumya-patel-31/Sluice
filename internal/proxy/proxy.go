@@ -28,12 +28,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/saumyapatel/sluice/internal/authz"
-	"github.com/saumyapatel/sluice/internal/config"
-	"github.com/saumyapatel/sluice/internal/identity"
-	"github.com/saumyapatel/sluice/internal/model"
-	"github.com/saumyapatel/sluice/internal/router"
-	"github.com/saumyapatel/sluice/internal/signals"
+	"github.com/Saumya-patel-31/sluice/internal/authz"
+	"github.com/Saumya-patel-31/sluice/internal/config"
+	"github.com/Saumya-patel-31/sluice/internal/identity"
+	"github.com/Saumya-patel-31/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/router"
+	"github.com/Saumya-patel-31/sluice/internal/signals"
 )
 
 // Config configures the data plane.

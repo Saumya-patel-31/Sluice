@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/saumyapatel/sluice/internal/model"
-	"github.com/saumyapatel/sluice/internal/signals"
+	"github.com/Saumya-patel-31/sluice/internal/model"
+	"github.com/Saumya-patel-31/sluice/internal/signals"
 )
 
 func TestStripComments(t *testing.T) {
