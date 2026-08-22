@@ -263,6 +263,86 @@ which is what makes it worth a guard rather than a fourth fix.
 Tagging a release is left to a human: it publishes artefacts under this
 account's name.
 
+### SLU-311 · The routing assertion was flaky by construction
+
+**Severity: high for a verification gate.** `k8s-verify` passed, then failed on
+the next push with nothing changed between them. A gate that fails at random is
+worse than no gate: it trains everyone to re-run it.
+
+It asserted that 60 requests through Envoy reached **at least two regions**.
+But the exploration floor is `0.02`, and the computed plan legitimately puts a
+region there:
+
+```
+payments       aws=0.511  azure=0.020  gcp=0.469
+interactive    aws=0.670  azure=0.020  gcp=0.310
+```
+
+A backend on the floor receives none of 60 draws with probability
+`0.98^60 ≈ 30%`. The assertion was a coin flip, and it was testing luck rather
+than the router.
+
+**Fixed:** the claim "the router distributes load" is a property of the plan it
+computed, not of where a sample landed, so the check now reads `/api/routes` and
+asserts the plan puts weight on more than one backend. That is deterministic,
+and it is the stronger statement — a router that computed a single-backend
+distribution is broken even when a lucky sample spreads across three. Where
+traffic actually landed is still asserted, but only as `> 0`, which is what
+catches the route-cache bug (SLU-107) and does not depend on chance.
+
+The check also now prints the plan, which turns out to be the best single
+diagnostic in the script:
+
+```
+        payments       aws-us-east-1=0.511  azure-francecentral=0.020  gcp-us-central1=0.469
+        interactive    aws-us-east-1=0.670  azure-francecentral=0.020  gcp-us-central1=0.310
+        batch          aws-us-east-1=0.209  azure-francecentral=0.768  gcp-us-central1=0.023
+        default        aws-us-east-1=0.748  azure-francecentral=0.169  gcp-us-central1=0.083
+```
+
+Batch traffic sits 77% in France — the low-carbon grid and the cheaper egress —
+while payments and interactive stay in the US for latency. The whole argument of
+the project, in four lines, from a live cluster.
+
+### SLU-312 · The central performance claim was never measured
+
+**Severity: moderate, and it undercut the design.** Sluice's architecture rests
+on one claim: multi-objective scoring is a control-loop concern at 1 Hz, and the
+request path only applies the plan the loop produced. **There were zero
+benchmarks.** The claim that a routing decision belongs inline in a request was
+an assertion.
+
+**Added:** `internal/router/bench_test.go` — the decision path single-threaded
+and under `RunParallel`, with the policy cache warm and deliberately cold, on
+deny as well as allow, across fleet sizes, plus `Recompute` itself.
+
+**What it showed.** The claim is substantially right — the scoring math is in
+`Recompute` — but the request path is **not O(1)**. It copies the candidate set
+twice per decision, once to give policy the backends it may filter on and once
+to record the scores in the decision, so allocations grow with the fleet:
+
+```
+backends=3   17 allocations per decision
+backends=12  30
+backends=48  66
+```
+
+Roughly a fixed 18 plus one per backend. That is the price of the ledger's
+explainability — every decision carries every candidate it considered, with the
+score and the reason it was or was not chosen — and against a 20–90 ms round
+trip it is worth paying. But it is a trade, it was undocumented, and it should
+not silently get worse.
+
+**Guarded, not just measured:** `internal/router/alloc_test.go` asserts the
+per-decision allocation count against a budget at each fleet size, and asserts
+that a **deny never allocates more than an allow** — otherwise an unauthorised
+caller costs the control plane more than a paying one. Allocation counts are
+used rather than wall-clock deliberately: these run on shared CI runners and on
+laptops with a container runtime alongside, where consecutive timings vary by
+2x, while the allocation count does not vary at all. A regression that
+matters — work migrating out of `Recompute`, a new per-request map, a copy
+turning quadratic — shows up there first and deterministically.
+
 ### Also in this pass
 
 - Three regional namespaces (`deploy/k8s/10-regions.yaml`) with `checkout`
@@ -296,8 +376,9 @@ account's name.
   load-bearing (without it Sluice never sees `x-forwarded-client-cert` and every
   request is anonymous), so it stays until it can be replaced and re-tested
   against the identity path rather than merely validated.
-- **Still no load test.** The claim that a decision belongs in a request path is
-  untested above roughly 100 rps.
+- **Still no end-to-end load test.** SLU-312 measured the decision path in
+  isolation; nothing has driven sustained traffic through Envoy and the
+  control plane together to find where the *system* saturates.
 - **No pprof endpoint.**
 - **The release workflow still has never been tagged.** SLU-310 fixed the
   defect that would have failed it, but only a real tag proves the rest.

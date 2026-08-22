@@ -74,6 +74,15 @@ jobs:
       - name: Test with the race detector
         run: go test -race -count=2 ./...
 
+      # The benchmarks are the evidence for the claim that a routing decision
+      # belongs inline in a request path. Timings are not asserted — these are
+      # shared runners and consecutive runs vary by 2x — but they must keep
+      # compiling and running, and the allocation budgets in
+      # internal/router/alloc_test.go, which do not vary at all, are enforced by
+      # the suite above.
+      - name: Benchmarks still run
+        run: go test ./internal/router -bench . -benchtime=10x -run '^$' 2>/dev/null
+
       - name: Coverage
         run: |
           go test -coverprofile=coverage.out -covermode=atomic ./...

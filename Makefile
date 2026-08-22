@@ -57,6 +57,10 @@ cover: ## Produce and summarise a coverage profile
 	@go tool cover -func=coverage.out | tail -n 1
 	@echo "html report: go tool cover -html=coverage.out"
 
+.PHONY: bench
+bench: ## Benchmark the decision path and the control loop
+	go test ./internal/router -bench . -benchmem -run '^$$' | grep -v '^2[0-9]'
+
 .PHONY: check
 check: fmt vet test ## Format, vet and test — run this before pushing
 	@git diff --quiet || { echo "gofmt changed files; commit them"; git diff --stat; exit 1; }
