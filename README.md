@@ -286,16 +286,68 @@ Two things in that configuration are load-bearing and non-obvious:
 
 ### On Kubernetes
 
+The whole stack — three regional namespaces, an Envoy data plane and the control
+plane — into a throwaway kind cluster:
+
 ```bash
-kubectl apply -f deploy/k8s/sluice.yaml
-# or
-helm install sluice deploy/helm/sluice
+make kind-up      # create the cluster, build and load the image, deploy
+make k8s-verify   # drive real mTLS traffic through it and assert where it landed
 ```
 
+Against a cluster you already have:
+
+```bash
+make k8s-deploy   # namespace, Secrets, then workloads, in that order
+make k8s-verify
+```
+
+`k8s-verify` is the part worth reading. It does not check that pods are Ready —
+every defect found while first deploying this passed that check, including a
+deployment with no data plane at all and one that denied 100% of legitimate
+traffic. It asserts behaviour: that an anonymous caller is refused at the TLS
+handshake, that an untrusted identity gets a 403, that 60 authorised mutual-TLS
+requests return 200, that they **landed on upstream pods** (counted from each
+region's own request counter *and* corroborated by Envoy's `upstream_rq_200`),
+and that traffic reached more than one region. CI runs the same script against a
+real kind cluster on every push.
+
+```
+==> routing
+  ok    60/60 authorised requests reached an upstream
+        aws-us-east-1          served 115
+        gcp-us-central1        served 28
+        azure-francecentral    served 7
+  ok    traffic distributed across 3 regions
+  ok    Envoy counted 150 successful upstream responses
+```
+
+Manifests, applied in dependency order by filename:
+
+| file | what it is |
+| --- | --- |
+| `10-regions.yaml` | three namespaces with a `checkout` Service each, standing in for AWS, GCP and Azure regions |
+| `15-envoy.yaml` | the data plane — **generated** from `deploy/envoy/envoy.yaml` by `scripts/render-k8s-envoy.sh`, so one bootstrap serves both Compose and Kubernetes |
+| `20-control-plane.yaml` | Sluice itself, plus PDB, NetworkPolicy and RBAC |
+| `30-servicemonitor.yaml` | optional; needs the Prometheus Operator's CRDs |
+
+Or with Helm:
+
+```bash
+helm install sluice deploy/helm/sluice --set api.token="$(make -s token)"
+```
+
+Nothing sensitive is committed. `make k8s-certs` generates the API token and a
+SPIFFE CA into Secrets, issuing under trust domain **`cluster.local`** — the
+SPIFFE convention in Kubernetes, and what the shipped policy recognises. Issuing
+under any other domain deploys cleanly, reports every pod healthy, and then
+refuses every request as an unrecognised trust domain. That is the system
+working as designed; it is also why `k8s-verify` exists.
+
 The control plane is stateless — the ledger and signal history are in-memory and
-deliberately disposable. Readiness requires a *computed traffic distribution*, not just a
-listening socket: before the first control loop finishes, the router would deny
-everything for want of a plan, and a pod in that state must not receive traffic.
+deliberately disposable. Readiness requires a *computed traffic distribution*,
+not just a listening socket: before the first control loop finishes, the router
+would deny everything for want of a plan, and a pod in that state must not
+receive traffic.
 
 Prometheus rules for availability, guardrails and signal freshness are in
 [`deploy/prometheus/alerts.yaml`](deploy/prometheus/alerts.yaml).

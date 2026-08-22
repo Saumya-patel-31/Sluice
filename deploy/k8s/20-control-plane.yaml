@@ -198,7 +198,7 @@ spec:
               app.kubernetes.io/name: sluice
       containers:
         - name: sluiced
-          image: ghcr.io/Saumya-patel-31/sluice:latest
+          image: ghcr.io/saumya-patel-31/sluice:latest
           imagePullPolicy: IfNotPresent
           args:
             - --config=/etc/sluice/sluice.jsonc
@@ -327,21 +327,3 @@ spec:
     # Provider pricing and grid-intensity APIs, when live signals are enabled.
     - ports:
         - { protocol: TCP, port: 443 }
----
-# Requires the Prometheus Operator. Without it, the pod annotations above are
-# enough for a scrape-config-based Prometheus.
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: sluice
-  namespace: sluice
-  labels:
-    app.kubernetes.io/name: sluice
-spec:
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: sluice
-  endpoints:
-    - port: http
-      path: /metrics
-      interval: 15s

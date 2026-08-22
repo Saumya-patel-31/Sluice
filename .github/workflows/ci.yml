@@ -202,6 +202,17 @@ jobs:
             envoyproxy/envoy:v1.32-latest \
             --mode validate -c /etc/envoy/envoy.yaml
 
+      # The Kubernetes data plane is rendered from the bootstrap above rather
+      # than maintained as a second copy, so a fix to one cannot miss the
+      # other. This fails if the checked-in render is stale.
+      - name: The Kubernetes render is up to date
+        run: |
+          ./scripts/render-k8s-envoy.sh /tmp/15-envoy.check.yaml
+          diff -u deploy/k8s/15-envoy.yaml /tmp/15-envoy.check.yaml || {
+            echo "deploy/k8s/15-envoy.yaml is stale; run: make envoy-render"
+            exit 1
+          }
+
   stack:
     name: end-to-end stack
     runs-on: ubuntu-latest
@@ -280,3 +291,44 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose -f deploy/docker-compose.yml down -v
+
+  kubernetes:
+    name: kubernetes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The manifests spent a long time as YAML nobody had applied. Rendering
+      # is not deploying and deploying is not routing: the first real apply
+      # failed on an unordered Secret, and the first successful rollout — every
+      # pod Ready, every probe green — denied 100% of legitimate traffic
+      # because the certificates carried a trust domain the policy did not
+      # recognise. Neither is visible without a cluster, so CI gets one.
+      - name: Create a cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: sluice
+          wait: 120s
+
+      - name: Build and load the image
+        run: |
+          docker build -t ghcr.io/saumya-patel-31/sluice:latest \
+            --build-arg VERSION=${GITHUB_SHA::8} .
+          kind load docker-image ghcr.io/saumya-patel-31/sluice:latest --name sluice
+
+      - name: Deploy
+        run: make k8s-deploy
+
+      # Drives real mutual-TLS traffic through Envoy from inside the cluster
+      # and asserts where it landed — including that an anonymous caller is
+      # refused at the handshake and an untrusted identity gets a 403.
+      - name: Verify routing end to end
+        run: make k8s-verify
+
+      - name: Dump state on failure
+        if: failure()
+        run: |
+          kubectl get pods -A
+          kubectl -n sluice describe pods || true
+          kubectl -n sluice logs -l app.kubernetes.io/name=sluice --tail=80 || true
+          kubectl -n sluice logs -l app.kubernetes.io/name=envoy --tail=40 || true

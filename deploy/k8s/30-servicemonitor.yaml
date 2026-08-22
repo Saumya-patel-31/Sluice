@@ -1,0 +1,27 @@
+# Optional: scrape configuration for the Prometheus Operator.
+#
+# Kept in its own file because applying it to a cluster without the operator's
+# CRDs makes `kubectl apply` exit non-zero — which, when it lived in the same
+# file as the Deployment, meant a perfectly good rollout reported failure on
+# any vanilla cluster.
+#
+#   kubectl apply -f deploy/k8s/30-servicemonitor.yaml
+#
+# Without the operator, the pod annotations on the Deployment are enough for a
+# scrape-config-based Prometheus, and deploy/prometheus/prometheus.yml shows
+# the static form.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: sluice
+  namespace: sluice
+  labels:
+    app.kubernetes.io/name: sluice
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sluice
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

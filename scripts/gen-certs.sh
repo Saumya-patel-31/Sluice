@@ -15,6 +15,32 @@
 
 set -eu
 
+# Git Bash / MSYS rewrites any argument that looks like a POSIX path into a
+# Windows one, which turns `-subj /CN=sluice-demo-ca` into
+# `-subj C:/Program Files/Git/CN=sluice-demo-ca` and makes openssl reject the
+# subject. Nothing in this script wants that translation.
+MSYS_NO_PATHCONV=1
+MSYS2_ARG_CONV_EXCL='*'
+export MSYS_NO_PATHCONV MSYS2_ARG_CONV_EXCL
+
+# openssl writes its progress dots to stderr, so the calls below discard it —
+# which also discards the error message when one fails. Route it through a log
+# instead and print it if the script dies, or a failure looks like a script
+# that silently produced no certificates.
+# Absolute: the script cd's into the output directory below, and a relative
+# log would be created there and shipped with the certificates.
+ERRLOG=$(mktemp 2>/dev/null) || ERRLOG="$PWD/.gen-certs.err"
+report_failure() {
+    status=$?
+    if [ "$status" -ne 0 ] && [ -s "$ERRLOG" ]; then
+        echo "gen-certs: openssl failed:" >&2
+        tail -5 "$ERRLOG" >&2
+    fi
+    rm -f "$ERRLOG"
+    exit "$status"
+}
+trap report_failure EXIT
+
 OUT="${1:-certs}"
 TRUST_DOMAIN="${TRUST_DOMAIN:-prod.internal}"
 DAYS="${DAYS:-365}"
@@ -33,7 +59,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days "$DAYS" \
     -subj "/CN=sluice-demo-ca/O=Sluice" \
     -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
     -addext "keyUsage=critical,keyCertSign,cRLSign" \
-    2>/dev/null
+    2>>"$ERRLOG"
 
 # issue <name> <spiffe-path> <extra-san>
 #
@@ -50,7 +76,7 @@ issue() {
 
     openssl req -newkey rsa:2048 -nodes \
         -keyout "${name}.key" -out "${name}.csr" \
-        -subj "/CN=${name}/O=Sluice" 2>/dev/null
+        -subj "/CN=${name}/O=Sluice" 2>>"$ERRLOG"
 
     cat > "${name}.ext" <<EOF
 basicConstraints = CA:FALSE
@@ -61,7 +87,7 @@ EOF
 
     openssl x509 -req -in "${name}.csr" -CA ca.crt -CAkey ca.key \
         -CAcreateserial -out "${name}.crt" -days "$DAYS" \
-        -extfile "${name}.ext" 2>/dev/null
+        -extfile "${name}.ext" 2>>"$ERRLOG"
 
     rm -f "${name}.csr" "${name}.ext"
     echo "    ${name}.crt  ${uri}"

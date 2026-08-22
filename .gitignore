@@ -21,6 +21,7 @@ coverage.html
 
 # TLS material for local mTLS experiments
 /certs/
+/certs-k8s/
 *.pem
 *.key
 *.crt

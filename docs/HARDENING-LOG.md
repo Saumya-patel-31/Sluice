@@ -9,6 +9,224 @@ finding that comes back.
 
 ---
 
+## Pass 4 — the Kubernetes deployment, applied for the first time
+
+**Date:** 2026-08-22
+**Posture before:** `deploy/k8s/` contained manifests nobody had ever applied.
+They rendered, they were well commented, and they had never met an API server.
+The previous pass listed this explicitly as a carried-forward gap: "the probes,
+the PDB and the NetworkPolicy are all theory."
+
+They were worse than theory. A first deploy on a clean cluster failed, and the
+first one that *succeeded* — every pod Ready, every probe green, the dashboard
+serving — denied 100% of legitimate traffic. Both findings below are invisible
+without a cluster, which is why CI now creates one.
+
+### SLU-301 · The Kubernetes deployment had no data plane
+
+**Severity: high.** `deploy/k8s/` deployed the control plane and nothing else.
+Sluice's control plane makes decisions; **Envoy is what asks it and then moves
+the packets.** Deployed to Kubernetes, the project was a router that routed
+nothing: the ext_authz listener was up, correctly, and had no caller.
+
+The symptom was not an error. Pods were Ready, `/api/overview` reported three
+healthy backends, `/metrics` served, and the decision count stayed at zero
+forever — a system that looks perfectly healthy and is not doing its job. The
+Compose stack hid this completely, because there Envoy is a sibling container.
+
+**Fixed:** `deploy/k8s/15-envoy.yaml` — Envoy Deployment (2 replicas), Service,
+and the bootstrap as a ConfigMap, with mTLS material from a Secret and a
+`checksum/config` annotation so a bootstrap change actually rolls the pods
+rather than leaving every replica on the old config indefinitely.
+
+**Not a second copy of the bootstrap.** The Kubernetes data plane differs from
+the Compose one in exactly four endpoint addresses, and a 327-line config
+maintained twice is a config where a fix lands in one and not the other — and a
+bootstrap that fails to load takes the whole data plane with it (see SLU-101,
+which is that exact failure). So `scripts/render-k8s-envoy.sh` generates the
+manifest from `deploy/envoy/envoy.yaml`, refuses to emit anything if a rewrite
+matched nothing or a Compose hostname survived, and `make envoy-render-check`
+(also a CI step) fails if the checked-in render has drifted.
+
+### SLU-302 · Every legitimate request was denied, with the cluster fully green
+
+**Severity: high, and the most interesting finding in the project.** After the
+data plane went in, mutual TLS negotiated, requests were authorised, decisions
+were recorded — and every single one was a **deny**.
+
+The shipped Kubernetes policy recognises trust domain `cluster.local`, which is
+the SPIFFE convention in Kubernetes and what SPIRE issues by default.
+`scripts/gen-certs.sh` issues under `prod.internal`. So every workload presented
+a valid certificate, chaining to a CA Envoy trusted, carrying an identity the
+policy had never heard of:
+
+```
+"verdict":"deny","denyReason":"unrecognised trust domain",
+"subject":"spiffe://prod.internal/ns/web/sa/feed"
+```
+
+Nothing in the cluster reported a problem. Readiness only asserts that the
+control loop produced a traffic plan; it did, and the plan was fine. The
+authorisation outcome is not a health signal.
+
+**This is the system behaving correctly.** An identity from an unrecognised
+trust domain *should* be refused — that is the entire zero-trust premise, and
+the alternative (defaulting to allow on an unknown domain) is the bug. The
+defect was a deployment that shipped certificates the shipped policy could not
+accept, and offered no signal saying so.
+
+**Fixed:** `make k8s-certs` issues with `TRUST_DOMAIN=cluster.local`, and the
+Makefile records why in a comment at the point of use. More importantly, the
+verification below now fails loudly on this class of problem rather than
+requiring somebody to notice.
+
+### SLU-303 · `make k8s-deploy` could not succeed on a clean cluster
+
+**Severity: moderate.** The target applied the Deployment and *then* created the
+API token Secret. On a cluster where that Secret already existed the order was
+invisible; on a fresh one — the only case that matters for "deployable" — both
+replicas sat in `CreateContainerConfigError` until the rollout timed out.
+
+**Fixed:** namespace and Secrets first, workloads second. `k8s-deploy` now
+depends on `k8s-certs`, which is idempotent and creates the namespace, the API
+token and the mTLS material before anything mounts them.
+
+### SLU-304 · The manifests could not be applied without the Prometheus Operator
+
+**Severity: low, high friction.** The `ServiceMonitor` lived in the same file as
+the Deployment. On any cluster without the operator's CRDs, `kubectl apply`
+applied the eight healthy objects, then exited **non-zero** on the ninth:
+
+```
+deployment.apps/sluice created
+service/sluice created
+...
+error: resource mapping not found for name: "sluice" ... no matches for kind
+"ServiceMonitor" in version "monitoring.coreos.com/v1"
+```
+
+A perfectly good rollout reported failure, and any script gating on that exit
+code would stop.
+
+**Fixed:** split into `deploy/k8s/30-servicemonitor.yaml`, applied on request,
+with the reason in the file so it does not get merged back.
+
+### SLU-305 · `gen-certs.sh` produced nothing on Windows, and said so quietly
+
+**Severity: moderate; portability.** Git Bash / MSYS rewrites arguments that
+look like POSIX paths into Windows ones, turning `-subj /CN=sluice-demo-ca` into
+`-subj 'C:/Program Files/Git/CN=sluice-demo-ca'`, which openssl rejects.
+
+Every openssl call redirected stderr to `/dev/null` — to hide the progress
+dots — which also hid the error. `set -eu` did stop the script, so the failure
+was at least not silent; it just gave no reason, and left one file behind:
+
+```
+==> certificate authority
+$ ls certs/
+ca.key
+```
+
+**Fixed:** `MSYS_NO_PATHCONV=1` / `MSYS2_ARG_CONV_EXCL='*'` exported at the top,
+and stderr routed to a log that an `EXIT` trap prints when the script dies.
+
+### SLU-306 · Readiness was the only thing anyone could check
+
+**Severity: this is the pass's actual finding.** Every defect above passed
+`kubectl get pods`. SLU-301 passed it with no data plane at all; SLU-302 passed
+it while refusing every request.
+
+**Fixed:** `scripts/verify-k8s.sh` (`make k8s-verify`), which asserts behaviour
+rather than status. It creates a probe pod satisfying the namespace's
+`restricted` Pod Security admission, then checks that:
+
+- an **anonymous** caller is refused at the TLS handshake (curl reports `000`) —
+  the request never reaches a policy decision;
+- an **untrusted identity** gets `403`;
+- **60 authorised mutual-TLS requests** through Envoy return `200`;
+- those requests **landed on upstream pods**, counted from each region's own
+  `/stats` across every replica — zero here is the exact symptom of the
+  route-cache bug in SLU-107;
+- traffic reached **more than one region**, so a router that pins everything to
+  a single backend fails;
+- **Envoy's own `upstream_rq_200` counters** agree, read per pod because the
+  counters are per-process and a Service-load-balanced query reads the wrong
+  replica.
+
+Every one of SLU-301 through SLU-305 fails at least one of these assertions.
+
+**Result on the live cluster:**
+
+```
+==> identity
+  ok    an anonymous caller is refused at the TLS handshake
+  ok    an untrusted identity is denied
+==> routing
+  ok    60/60 authorised requests reached an upstream
+        aws-us-east-1          served 115
+        gcp-us-central1        served 28
+        azure-francecentral    served 7
+  ok    150 requests landed on upstreams
+  ok    traffic distributed across 3 regions
+==> observability
+  ok    3 backends healthy and probed through cluster DNS
+  ok    Envoy counted 150 successful upstream responses
+```
+
+Envoy's count and the upstreams' own count agree exactly, from two independent
+sources. The distribution is the softmax allocation the control loop computed,
+not round-robin.
+
+### SLU-307 · CI now stands up a cluster
+
+The `kubernetes` job creates a kind cluster, builds and loads the image, runs
+`make k8s-deploy`, and runs `make k8s-verify`. Manifests that render are not
+manifests that deploy, and manifests that deploy are not a system that routes;
+this pass produced one finding at each of those three levels, so the pipeline
+checks all three.
+
+CI is now eight jobs: `test`, `build`, `policy`, `image`, `chart`, `envoy`,
+`end-to-end stack`, `kubernetes`.
+
+### Also in this pass
+
+- Three regional namespaces (`deploy/k8s/10-regions.yaml`) with `checkout`
+  Deployments and Services, so the DNS names the config already referenced
+  resolve to something.
+- `deploy/k8s/sluice.yaml` renamed `20-control-plane.yaml`; the files now apply
+  in dependency order by name.
+- The image reference was `ghcr.io/Saumya-patel-31/...`. Registries reject
+  uppercase repository names, so it never could have pulled.
+
+### Verified working, first time
+
+- The `restricted` Pod Security admission on the namespace, which rejected a
+  throwaway debug pod that omitted a `securityContext` — while the Envoy
+  Deployment complied as written.
+- Cluster DNS to all three regional Services; probes and latency measurements
+  arrived without adjustment.
+- The PodDisruptionBudget, the resource requests, both probes, and the
+  read-only root filesystem on every container.
+
+### Known gaps, carried forward
+
+- **The NetworkPolicy is still untested.** kind's default CNI does not enforce
+  NetworkPolicy, so it applied cleanly and proved nothing. It needs a cluster
+  running Calico or Cilium to mean anything.
+- **`allowed_headers` on ext_authz remains deprecated.** Envoy 1.32 warns on
+  every load. The obvious fix — hoisting the field to the filter level — does
+  not parse, and round-tripping the bootstrap through a YAML library to do it
+  properly would strip the comments that make that file maintainable. It is
+  load-bearing (without it Sluice never sees `x-forwarded-client-cert` and every
+  request is anonymous), so it stays until it can be replaced and re-tested
+  against the identity path rather than merely validated.
+- **Still no load test.** The claim that a decision belongs in a request path is
+  untested above roughly 100 rps.
+- **No pprof endpoint.**
+- **The release workflow has never been tagged.**
+
+---
+
 ## Pass 3 — observability that can be checked
 
 **Date:** 2026-08-16

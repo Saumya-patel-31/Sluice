@@ -1,0 +1,441 @@
+# Envoy data plane — GENERATED, DO NOT EDIT.
+#
+#   source:    deploy/envoy/envoy.yaml
+#   regenerate: ./scripts/render-k8s-envoy.sh
+#
+# Edit the source bootstrap and re-render. `make envoy-render-check` fails if
+# this file has drifted from it.
+#
+# The mTLS material comes from a Secret rather than this manifest: a private key
+# committed to git is a private key in everyone's clone. `make k8s-deploy`
+# generates it with scripts/gen-certs.sh.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: envoy-config
+  namespace: sluice
+  labels:
+    app.kubernetes.io/name: envoy
+    app.kubernetes.io/part-of: sluice
+data:
+  envoy.yaml: |
+    # Envoy configuration for a Sluice data plane.
+    #
+    # The whole integration is one ext_authz filter and a header-matched route
+    # table. There is no custom Envoy filter to build, no WASM module to ship and
+    # no xDS server to operate: Sluice answers an ordinary HTTP call, returns the
+    # destination as a response header, and Envoy's own route table does the rest.
+    #
+    # Request flow:
+    #   1. Envoy terminates mutual TLS and derives x-forwarded-client-cert from the
+    #      client certificate it verified.
+    #   2. Envoy calls Sluice's ext_authz endpoint before forwarding.
+    #   3. Sluice authorises the request and picks a backend from the traffic
+    #      distribution its control loop computed, answering 200 with
+    #      x-sluice-backend: <cluster-name>.
+    #   4. A Lua filter modifies a request header, which invalidates the cached
+    #      route.
+    #   5. The router re-resolves the route, whose `cluster_header` names
+    #      x-sluice-backend, and forwards to that cluster.
+    #
+    # Step 4 is the load-bearing one, and it is not obvious. Envoy resolves the
+    # route once, *before* the filter chain runs, so at that point the header
+    # ext_authz is about to set does not exist. Without something to invalidate
+    # that cached route, every request fails with the NC (no cluster) flag while
+    # ext_authz reports success and the access log shows the header populated —
+    # a failure that looks like anything except what it is.
+    #
+    # Verified against Envoy 1.32. Both obvious alternatives were tried and do not
+    # work: one route per backend matching on the header falls through to the
+    # catch-all, and `cluster_header` alone yields NC.
+    
+    admin:
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 9901 }
+    
+    static_resources:
+      listeners:
+        - name: edge
+          address:
+            socket_address: { address: 0.0.0.0, port_value: 10000 }
+          filter_chains:
+            - transport_socket:
+                # Real mutual TLS, because the identity has to come from somewhere
+                # a caller cannot forge.
+                #
+                # Envoy defaults forward_client_cert_details to SANITIZE, which
+                # *strips* any client-supplied x-forwarded-client-cert. That is
+                # exactly right — otherwise any caller could assert whatever SPIFFE
+                # ID it liked by setting a header — and it means the header Sluice
+                # reads can only be one Envoy generated itself, from a certificate
+                # it verified against the CA below.
+                name: envoy.transport_sockets.tls
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+                  require_client_certificate: true
+                  common_tls_context:
+                    tls_certificates:
+                      - certificate_chain: { filename: /etc/sluice/certs/server.crt }
+                        private_key: { filename: /etc/sluice/certs/server.key }
+                    validation_context:
+                      trusted_ca: { filename: /etc/sluice/certs/ca.crt }
+              filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: sluice_edge
+                    codec_type: AUTO
+                    use_remote_address: true
+                    # Trust exactly one hop of X-Forwarded-For. Sluice's CIDR
+                    # policies key off the resulting address, so a larger number
+                    # here would let a caller present itself as coming from the
+                    # corporate range.
+                    xff_num_trusted_hops: 0
+                    # Treat no address as "internal". Envoy's legacy default
+                    # trusts every RFC1918 range, which on an edge listener means
+                    # anything arriving from a private network is credited with
+                    # whatever XFF it supplied. An empty range list is the
+                    # zero-trust reading, and it silences the deprecation warning
+                    # about relying on the old default.
+                    internal_address_config:
+                      cidr_ranges: []
+    
+                    # Replace any inbound XFCC with one derived from the
+                    # certificate this listener actually verified, and include the
+                    # URI SAN — that is the SPIFFE ID Sluice's policy engine reads.
+                    # SANITIZE_SET rather than APPEND_FORWARD: appending would let
+                    # a caller prepend a forged element, and Sluice reads the last
+                    # one but an operator reading the header would see both.
+                    forward_client_cert_details: SANITIZE_SET
+                    set_current_client_cert_details:
+                      uri: true
+                      subject: true
+    
+                    access_log:
+                      - name: envoy.access_loggers.stdout
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                          log_format:
+                            json_format:
+                              time: "%START_TIME%"
+                              method: "%REQ(:METHOD)%"
+                              path: "%REQ(:PATH)%"
+                              status: "%RESPONSE_CODE%"
+                              duration_ms: "%DURATION%"
+                              bytes: "%BYTES_SENT%"
+                              # These come back from Sluice, which makes an Envoy
+                              # access log joinable against the decision ledger.
+                              backend: "%REQ(X-SLUICE-BACKEND)%"
+                              cloud: "%REQ(X-SLUICE-CLOUD)%"
+                              decision: "%REQ(X-SLUICE-DECISION)%"
+                              deny_reason: "%RESP(X-SLUICE-DENY-REASON)%"
+                              flags: "%RESPONSE_FLAGS%"
+    
+                    route_config:
+                      name: sluice_routes
+                      virtual_hosts:
+                        - name: all
+                          domains: ["*"]
+                          routes:
+                            # One route for everything, with the upstream cluster
+                            # taken from the header the authorisation response set.
+                            #
+                            # `cluster_header` is Envoy's purpose-built mechanism
+                            # for letting an external service choose the upstream,
+                            # and it is resolved by the router filter *after*
+                            # ext_authz has run.
+                            #
+                            # The obvious alternative — one route per backend
+                            # matching on that header — does not work, and fails
+                            # silently: the route is selected before ext_authz
+                            # adds the header, so every request falls through to
+                            # the catch-all. Verified against Envoy 1.32, where
+                            # ext_authz reported 1601 successful checks while every
+                            # cluster showed upstream_rq_total: 0.
+                            #
+                            # This shape is also the one that scales: adding a
+                            # region means adding a cluster, and nothing else.
+                            - match: { prefix: "/" }
+                              route:
+                                cluster_header: x-sluice-backend
+                                timeout: 15s
+                                retry_policy:
+                                  retry_on: "5xx,reset,connect-failure"
+                                  num_retries: 1
+    
+                            # If the named cluster does not exist, Envoy answers
+                            # 503 with the NC response flag, which the access log
+                            # records — configuration drift between Sluice and
+                            # Envoy is then visible rather than mysterious.
+    
+                    http_filters:
+                      - name: envoy.filters.http.ext_authz
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                          transport_api_version: V3
+                          # Fail closed. An authorisation service that cannot be
+                          # reached has not authorised anything, and a router that
+                          # admits traffic when its policy engine is down is not a
+                          # zero-trust router.
+                          failure_mode_allow: false
+                          # Decisions take tens of microseconds; a quarter second
+                          # is generous and bounds the blast radius of a stall.
+                          http_service:
+                            server_uri:
+                              uri: http://sluiced:8081
+                              cluster: sluice_authz
+                              timeout: 0.25s
+                            authorization_request:
+                              # NOTE: `allowed_headers` is deprecated and Envoy
+                              # warns about it on load. It is load-bearing here —
+                              # without it, ext_authz forwards only authority,
+                              # method, path and content-length, so
+                              # x-forwarded-client-cert never reaches Sluice and
+                              # every request is anonymous. Do not drop it while
+                              # upgrading Envoy without re-testing the identity
+                              # path; the failure mode is silent, and looks like
+                              # "policy suddenly denies everything".
+                              allowed_headers:
+                                patterns:
+                                  # The caller's verified identity, set by the mesh
+                                  # sidecar or by this listener's TLS context.
+                                  - exact: x-forwarded-client-cert
+                                  - exact: authorization
+                                  # Hints about the request. These are caller
+                                  # assertions, but the worst a liar achieves is
+                                  # stricter routing for their own traffic.
+                                  - exact: x-sluice-data-class
+                                  - exact: x-sluice-bytes
+                                  - exact: x-sluice-geo
+                                  - exact: content-length
+                                  - prefix: x-envoy-
+                              headers_to_add:
+                                - key: x-sluice-via
+                                  value: envoy
+                            authorization_response:
+                              # Everything Sluice decided travels upstream, which
+                              # is also what triggers the route cache clear.
+                              allowed_upstream_headers:
+                                patterns:
+                                  - prefix: x-sluice-
+                              # On a refusal the client learns why, which is the
+                              # difference between a debuggable 403 and a mystery.
+                              allowed_client_headers:
+                                patterns:
+                                  - exact: x-sluice-deny-reason
+                                  - exact: x-sluice-decision
+    
+                      # Force route re-resolution now that ext_authz has set
+                      # x-sluice-backend.
+                      #
+                      # This is the load-bearing piece of the whole integration.
+                      # Envoy resolves the route — including `cluster_header` — once,
+                      # before the filter chain runs, so at that point the header
+                      # does not exist yet and the lookup finds no cluster. The
+                      # failure is silent and confusing: ext_authz reports success,
+                      # the access log shows the header populated, and every request
+                      # still returns 503 with the NC (no cluster) flag.
+                      #
+                      # Clearing the cache here makes the router resolve the cluster
+                      # from the header ext_authz just set. Verified against Envoy
+                      # 1.32: without this filter, upstream_rq_total stays at 0 on
+                      # every cluster.
+                      - name: envoy.filters.http.lua
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                          default_source_code:
+                            inline_string: |
+                              function envoy_on_request(handle)
+                                -- Modifying a request header makes the Lua filter
+                                -- invalidate the cached route, which is what forces
+                                -- `cluster_header` to be resolved again now that
+                                -- ext_authz has set x-sluice-backend.
+                                handle:headers():replace("x-sluice-reroute", "1")
+                              end
+    
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+    
+      clusters:
+        - name: sluice_authz
+          type: STRICT_DNS
+          connect_timeout: 1s
+          lb_policy: ROUND_ROBIN
+          # Keep connections warm: a TCP handshake per authorisation would dominate
+          # the decision's own cost by an order of magnitude.
+          typed_extension_protocol_options:
+            envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+              "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+              explicit_http_config:
+                http_protocol_options: {}
+          load_assignment:
+            cluster_name: sluice_authz
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address: { address: sluice.sluice.svc.cluster.local, port_value: 8081 }
+          health_checks:
+            - timeout: 1s
+              interval: 5s
+              unhealthy_threshold: 3
+              healthy_threshold: 1
+              http_health_check: { path: /healthz }
+    
+        # Upstream regions.
+        #
+        # Written out in full rather than with a YAML anchor and merge key. Envoy
+        # parses YAML into protobuf strictly, and `<<` is a YAML 1.1 merge-key
+        # extension it does not implement — it reports `no such field: '<<'` and
+        # refuses the *entire* bootstrap. A config that fails to load takes the
+        # data plane with it, so the repetition here is deliberate.
+        #
+        # Outlier detection is conservative on purpose: Sluice's own circuit
+        # breakers already eject failing backends from the distribution, and two
+        # ejection mechanisms racing each other produce traffic patterns nobody can
+        # explain afterwards. Envoy's job is only to catch a host failing faster
+        # than the control loop's one-second cadence.
+        - name: aws-us-east-1
+          type: STRICT_DNS
+          connect_timeout: 2s
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: aws-us-east-1
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address: { address: checkout.aws-us-east-1.svc.cluster.local, port_value: 8080 }
+          outlier_detection:
+            consecutive_5xx: 8
+            interval: 10s
+            base_ejection_time: 15s
+            max_ejection_percent: 50
+    
+        - name: gcp-us-central1
+          type: STRICT_DNS
+          connect_timeout: 2s
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: gcp-us-central1
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address: { address: checkout.gcp-us-central1.svc.cluster.local, port_value: 8080 }
+          outlier_detection:
+            consecutive_5xx: 8
+            interval: 10s
+            base_ejection_time: 15s
+            max_ejection_percent: 50
+    
+        - name: azure-francecentral
+          type: STRICT_DNS
+          connect_timeout: 2s
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: azure-francecentral
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address: { address: checkout.azure-francecentral.svc.cluster.local, port_value: 8080 }
+          outlier_detection:
+            consecutive_5xx: 8
+            interval: 10s
+            base_ejection_time: 15s
+            max_ejection_percent: 50
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: envoy
+  namespace: sluice
+  labels:
+    app.kubernetes.io/name: envoy
+    app.kubernetes.io/part-of: sluice
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: envoy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: envoy
+        app.kubernetes.io/part-of: sluice
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9901"
+        prometheus.io/path: /stats/prometheus
+        # Roll the pods when the bootstrap changes. Without this a ConfigMap
+        # edit leaves every replica running the previous config indefinitely,
+        # because a projected volume update does not restart Envoy.
+        checksum/config: "ed87a7d4f517703d"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: envoy
+          image: envoyproxy/envoy:v1.32-latest
+          args:
+            - --config-path
+            - /etc/envoy/envoy.yaml
+            - --log-level
+            - warn
+          ports:
+            - { name: https, containerPort: 10000, protocol: TCP }
+            - { name: admin, containerPort: 9901, protocol: TCP }
+          # /ready is Envoy's own listener-level readiness. It goes green only
+          # once the listeners are actually serving, which is the property this
+          # probe is meant to assert.
+          readinessProbe:
+            httpGet: { path: /ready, port: admin }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /ready, port: admin }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 100m, memory: 96Mi }
+            limits:   { memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/envoy,        readOnly: true }
+            - { name: certs,  mountPath: /etc/sluice/certs, readOnly: true }
+            - { name: tmp,    mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap: { name: envoy-config }
+        - name: certs
+          secret:
+            secretName: sluice-certs
+            # Envoy runs as uid 101 and cannot read a 0600 key. This is the
+            # same permission problem that broke the CI validation job.
+            defaultMode: 0444
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: envoy
+  namespace: sluice
+  labels:
+    app.kubernetes.io/name: envoy
+    app.kubernetes.io/part-of: sluice
+spec:
+  selector:
+    app.kubernetes.io/name: envoy
+  ports:
+    - { name: https, port: 10000, targetPort: https, protocol: TCP }
+    - { name: admin, port: 9901,  targetPort: admin, protocol: TCP }
