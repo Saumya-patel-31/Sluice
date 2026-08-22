@@ -7,7 +7,7 @@ SHELL := /bin/sh
 .DEFAULT_GOAL := help
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-IMAGE   ?= ghcr.io/Saumya-patel-31/sluice
+IMAGE   ?= ghcr.io/saumya-patel-31/sluice
 GOFLAGS ?= -trimpath
 LDFLAGS := -s -w -X main.version=$(VERSION)
 

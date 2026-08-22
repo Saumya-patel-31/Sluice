@@ -239,6 +239,30 @@ job that fails on any `*.sh` staged at anything but `100755`. The next script
 added from a Windows checkout would land the same way, and point at the wrong
 thing again.
 
+### SLU-310 · The release workflow would have failed at the first tag
+
+**Severity: moderate; it blocks the one path that had never been run.** The
+release workflow derived its image name from `${{ github.repository }}`, which
+for this account is `Saumya-patel-31/Sluice`. **Container registries reject an
+uppercase repository name.** The push to GHCR and the provenance attestation
+(`subject-name` must be lowercase) would both have failed on the first `v*` tag
+— on a workflow whose earlier jobs, including the race-detector suite and
+`govulncheck`, had already spent several minutes passing.
+
+The same name was wrong in two more places that nothing had exercised:
+`IMAGE` in the Makefile, so `make image` builds a tag that cannot be pushed;
+and `image.repository` in the Helm chart's values, so a default install pulls
+an image that does not exist.
+
+**Fixed:** all three pinned lowercase, and a check in the `test` job that greps
+every manifest, workflow, Makefile and Dockerfile for an uppercase character in
+a `ghcr.io/...` reference. This is the third time the same mistake has appeared
+in a different file — it was already fixed once in the Kubernetes manifests —
+which is what makes it worth a guard rather than a fourth fix.
+
+Tagging a release is left to a human: it publishes artefacts under this
+account's name.
+
 ### Also in this pass
 
 - Three regional namespaces (`deploy/k8s/10-regions.yaml`) with `checkout`
@@ -247,7 +271,8 @@ thing again.
 - `deploy/k8s/sluice.yaml` renamed `20-control-plane.yaml`; the files now apply
   in dependency order by name.
 - The image reference was `ghcr.io/Saumya-patel-31/...`. Registries reject
-  uppercase repository names, so it never could have pulled.
+  uppercase repository names, so it never could have pulled. The same name
+  was wrong in three more places; see SLU-310.
 
 ### Verified working, first time
 
@@ -274,7 +299,8 @@ thing again.
 - **Still no load test.** The claim that a decision belongs in a request path is
   untested above roughly 100 rps.
 - **No pprof endpoint.**
-- **The release workflow has never been tagged.**
+- **The release workflow still has never been tagged.** SLU-310 fixed the
+  defect that would have failed it, but only a real tag proves the rest.
 
 ---
 

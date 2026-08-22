@@ -18,7 +18,12 @@ permissions:
 env:
   GO_VERSION: "1.26.6"   # floor set by govulncheck; see go.mod
   REGISTRY: ghcr.io
-  IMAGE: ${{ github.repository }}
+  # Deliberately not `${{ github.repository }}`: this account's repository is
+  # `Saumya-patel-31/Sluice`, and container registries reject an uppercase
+  # repository name. Every consumer of this name — the deploy manifests, the
+  # Helm chart's default — is already lowercase, so it is pinned here rather
+  # than derived and silently wrong at the first tag.
+  IMAGE: saumya-patel-31/sluice
 
 jobs:
   # Nothing gets published from a tree that does not pass its own suite. The
