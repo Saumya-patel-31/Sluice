@@ -32,6 +32,21 @@ jobs:
             exit 1
           fi
 
+
+      # Git for Windows cannot detect the executable bit, so a script authored
+      # there is committed 100644 and every `./scripts/foo.sh` in this pipeline
+      # becomes "Permission denied" on the runner. That is how the Kubernetes
+      # job first failed, and it would come back with the next script.
+      - name: Shell scripts are executable
+        run: |
+          bad=$(git ls-files --stage '*.sh' | awk '$1 != "100755" {print $4}')
+          if [ -n "$bad" ]; then
+            echo "these scripts are not executable in git:"
+            echo "$bad"
+            echo
+            echo "fix with: git update-index --chmod=+x <file>"
+            exit 1
+          fi
       - name: Vet
         run: go vet ./...
 
