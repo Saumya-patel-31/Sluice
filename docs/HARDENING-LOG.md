@@ -343,6 +343,14 @@ laptops with a container runtime alongside, where consecutive timings vary by
 matters — work migrating out of `Recompute`, a new per-request map, a copy
 turning quadratic — shows up there first and deterministically.
 
+One wrinkle worth recording, because it failed CI once: **allocation budgets are
+meaningless under `-race`.** The race detector instruments every allocation, so
+`testing.AllocsPerRun` measures the instrumentation rather than the code, and
+the suite runs with `-race -count=2`. The file carries a `//go:build !race`
+constraint and CI runs it in a separate step without the detector — otherwise
+the tag would have quietly excluded it from every run and the budget would have
+guarded nothing.
+
 ### Also in this pass
 
 - Three regional namespaces (`deploy/k8s/10-regions.yaml`) with `checkout`

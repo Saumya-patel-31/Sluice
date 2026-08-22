@@ -1,3 +1,10 @@
+//go:build !race
+
+// Allocation budgets are meaningless under the race detector: it instruments
+// every allocation, so testing.AllocsPerRun measures the instrumentation rather
+// than the code. CI runs the suite with -race, and these are run separately
+// without it — see the "Allocation budgets" step in .github/workflows/ci.yml.
+
 package router
 
 import (
