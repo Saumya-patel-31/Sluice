@@ -240,6 +240,41 @@ changed decisions:
 `sluicectl policy test` exits non-zero when traffic that flows today would be refused, so
 it drops into CI as a gate.
 
+## What a decision costs
+
+The architecture rests on one claim: multi-objective scoring is a control-loop
+concern at 1 Hz, and the request path only applies the plan the loop produced.
+`make bench` is the evidence.
+
+The claim is substantially right — the normalise, weight, softmax, SLO-shed, cap
+and damp work all happens in `Recompute` — and it glosses over one thing. The
+request path is **not O(1)**: it copies the candidate set twice per decision,
+once to hand policy the backends it may filter on and once to record the scores
+in the decision. So allocations grow with the fleet.
+
+| backends | allocations per decision |
+| --- | --- |
+| 3 | 17 |
+| 12 | 30 |
+| 48 | 66 |
+
+Roughly a fixed 18 plus one per backend. That is the price of the ledger's
+explainability — every decision carries every candidate it considered, with its
+score and the reason it was or was not chosen — and against a 20–90 ms
+cross-region round trip it is a trade worth making. It is a trade, though, so
+`internal/router/alloc_test.go` holds it to a budget at each fleet size and CI
+enforces it.
+
+Allocation counts rather than wall-clock, deliberately: these run on shared CI
+runners and on laptops with a container runtime alongside, where consecutive
+timings vary by 2x, while the allocation count does not vary at all. A
+regression that matters — work migrating out of `Recompute`, a new per-request
+map, a copy turning quadratic — shows up there first and deterministically.
+
+The suite also asserts that **a deny never allocates more than an allow**.
+Otherwise an unauthorised caller would cost the control plane more than a paying
+one, which is a denial-of-service shape rather than a performance note.
+
 ## Deployment
 
 ### With Envoy
