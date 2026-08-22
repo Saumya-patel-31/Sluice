@@ -94,7 +94,11 @@ jobs:
       # check.
       - name: Backtest the shipped policy document
         run: |
-          go run ./cmd/sluiced --demo --listen :8080 --log-level warn &
+          # Loopback, not :8080. The control plane refuses to start bound to a
+          # routable address without an API token, and this job talks to
+          # localhost, so loopback is the honest configuration rather than
+          # reaching for --dev-insecure to silence the check.
+          go run ./cmd/sluiced --demo --listen 127.0.0.1:8080 --log-level warn &
           SLUICED=$!
           trap 'kill $SLUICED' EXIT
 
@@ -129,7 +133,11 @@ jobs:
 
       - name: Smoke-test the image
         run: |
-          docker run -d --name sluice -p 8080:8080 sluice:ci --demo
+          # No arguments: use the image's own CMD. Overriding it with --demo
+          # replaces the whole command, dropping --listen 0.0.0.0:8080, and the
+          # process then binds loopback *inside* the container where -p cannot
+          # reach it. Running the default is also what a user actually gets.
+          docker run -d --name sluice -p 8080:8080 sluice:ci
           for i in $(seq 1 30); do
             if curl -sf http://localhost:8080/readyz >/dev/null; then break; fi
             sleep 1
@@ -183,6 +191,10 @@ jobs:
             -keyout /tmp/certs/server.key -out /tmp/certs/server.crt \
             -subj "/CN=validate" 2>/dev/null
           cp /tmp/certs/server.crt /tmp/certs/ca.crt
+          # openssl writes the key 0600 owned by the runner; Envoy runs as uid
+          # 101 and cannot read it, so validation fails on the key rather than
+          # on anything to do with the config. These are throwaway certs.
+          chmod 644 /tmp/certs/*
 
           docker run --rm \
             -v "$PWD/deploy/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro" \

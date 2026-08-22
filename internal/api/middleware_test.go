@@ -213,3 +213,32 @@ func TestAuthenticatorReadGate(t *testing.T) {
 		t.Errorf("authenticated read = %d, want 204", rec2.Code)
 	}
 }
+
+// The policy backtest is a POST because a policy document does not belong in a
+// query string, not because it changes anything. Gating it like a mutation
+// would make `sluicectl policy test` — the command meant to run in CI against
+// a production control plane, before a change — need the same credential as
+// installing that change.
+func TestBacktestIsNotGatedAsAMutation(t *testing.T) {
+	a := NewAuthenticator("right", false, false, discardLogger())
+	h := a.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	post := func(path string) int {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader("{}")))
+		return rec.Code
+	}
+
+	if got := post("/api/policy/backtest"); got != http.StatusNoContent {
+		t.Errorf("unauthenticated backtest = %d, want 204", got)
+	}
+
+	// Everything that genuinely changes state stays gated.
+	for _, path := range []string{"/api/policy", "/api/incidents", "/api/policy/backtest/../../policy"} {
+		if got := post(path); got == http.StatusNoContent {
+			t.Errorf("%s was allowed unauthenticated", path)
+		}
+	}
+}

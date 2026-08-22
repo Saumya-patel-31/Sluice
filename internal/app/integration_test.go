@@ -333,7 +333,6 @@ func TestAPIAuthentication(t *testing.T) {
 			{http.MethodPut, "/api/policy", openPolicy},
 			{http.MethodPost, "/api/incidents", `{"backendId":"aws-us-east-1","kind":"outage"}`},
 			{http.MethodDelete, "/api/incidents/whatever", ""},
-			{http.MethodPost, "/api/policy/backtest", openPolicy},
 		} {
 			rec := send(c.method, c.path, c.body, nil)
 			if rec.Code != http.StatusUnauthorized {
@@ -342,6 +341,30 @@ func TestAPIAuthentication(t *testing.T) {
 			if got := rec.Header().Get("WWW-Authenticate"); got == "" {
 				t.Errorf("%s %s: missing WWW-Authenticate", c.method, c.path)
 			}
+		}
+	})
+
+	t.Run("the backtest is readable without a credential", func(t *testing.T) {
+		// It compiles a candidate document and replays retained decisions
+		// against it, installing nothing. Gating it as a mutation would mean
+		// `sluicectl policy test` needed the same credential as applying a
+		// change, which defeats having a safe way to ask what would break.
+		rec := send(http.MethodPost, "/api/policy/backtest", openPolicy, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unauthenticated backtest = %d, want 200", rec.Code)
+		}
+
+		// ...and it must still not have changed anything.
+		var after struct {
+			Hash string `json:"hash"`
+		}
+		getJSON(t, h, "/api/policy", &after)
+		var live struct {
+			Policies []any `json:"policies"`
+		}
+		getJSON(t, h, "/api/policy", &live)
+		if len(live.Policies) < 2 {
+			t.Error("the backtest appears to have installed its candidate document")
 		}
 	})
 

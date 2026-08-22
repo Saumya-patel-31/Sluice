@@ -80,13 +80,30 @@ func (a *Authenticator) valid(token string) bool {
 	return subtle.ConstantTimeCompare(got[:], a.tokenHash[:]) == 1
 }
 
+// effectivelyRead lists endpoints that use POST for request-body reasons but
+// change no control-plane state.
+//
+// The policy backtest is a pure function of the document you hand it and the
+// decisions already in the ledger: it compiles a candidate, replays retained
+// traffic through it, and reports the difference. Nothing is installed. It is
+// a POST only because a policy document does not belong in a query string.
+var effectivelyRead = map[string]bool{
+	"/api/policy/backtest": true,
+}
+
 // isMutation reports whether a request changes control-plane state.
+//
+// Classified by effect rather than by verb. Gating on the method alone would
+// make `sluicectl policy test` — the command that exists to be run in CI
+// *before* a change, against a production control plane — require the same
+// credential as installing that change, which defeats the point of having a
+// safe way to ask "what would this break".
 func isMutation(r *http.Request) bool {
 	switch r.Method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
 		return false
 	}
-	return true
+	return !effectivelyRead[r.URL.Path]
 }
 
 // Middleware enforces the policy on every /api request.

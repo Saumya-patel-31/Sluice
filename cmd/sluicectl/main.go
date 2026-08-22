@@ -21,11 +21,14 @@ import (
 
 var (
 	addr    string
+	token   string
 	timeout time.Duration
 )
 
 func main() {
 	flag.StringVar(&addr, "addr", envOr("SLUICE_ADDR", "http://localhost:8080"), "control plane base URL")
+	flag.StringVar(&token, "token", envOr("SLUICE_API_TOKEN", ""),
+		"bearer token for mutating commands (also $SLUICE_API_TOKEN)")
 	flag.DurationVar(&timeout, "timeout", 15*time.Second, "request timeout")
 	flag.Usage = usage
 	flag.Parse()
@@ -115,6 +118,9 @@ func do(method, path string, body io.Reader, out any) error {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	resp, err := (&http.Client{Timeout: timeout}).Do(req)
 	if err != nil {
 		return fmt.Errorf("%s is not reachable: %w", addr, err)
@@ -130,6 +136,10 @@ func do(method, path string, body io.Reader, out any) error {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		_ = json.Unmarshal(raw, &e)
 		switch {
+		case resp.StatusCode == http.StatusUnauthorized && token == "":
+			return fmt.Errorf("%s requires a bearer token; set $SLUICE_API_TOKEN or pass --token", path)
+		case resp.StatusCode == http.StatusUnauthorized:
+			return fmt.Errorf("%s rejected the supplied token", path)
 		case e.Line > 0:
 			return fmt.Errorf("line %d: %s", e.Line, firstNonEmpty(e.Message, e.Error))
 		case e.Error != "":
