@@ -167,3 +167,53 @@ sum=$(echo "$bootstrap" | sha256sum 2>/dev/null | cut -c1-16 \
 sed -i.bak "s/CONFIGSUM/$sum/" "$OUT" && rm -f "$OUT.bak"
 
 echo "rendered $OUT (bootstrap $sum)"
+
+# ---------------------------------------------------------------------------
+# Helm
+# ---------------------------------------------------------------------------
+#
+# The chart needs the same bootstrap with two things made dynamic: the control
+# plane's address (release name and namespace are not known until install) and
+# the upstream clusters (which follow .Values.backends, so a chart that adds a
+# region gets an Envoy cluster for it rather than a route to nowhere).
+#
+# So the chart gets everything up to and including the sluice_authz cluster as
+# a file rendered through `tpl`, and generates the region clusters itself.
+# Splitting here rather than at `clusters:` keeps the keepalive and health-check
+# rationale on the authz cluster where it was written.
+
+HELM_FILE="deploy/helm/sluice/files/envoy-bootstrap.yaml"
+
+if [ -d "deploy/helm/sluice" ]; then
+    mkdir -p "$(dirname "$HELM_FILE")"
+
+    # Everything before the upstream regions, with the authz endpoint templated.
+    split_line=$(grep -n '^    # Upstream regions\.' "$SRC" | cut -d: -f1)
+    [ -n "$split_line" ] || {
+        echo "render-k8s-envoy: cannot find the upstream-regions marker in $SRC" >&2
+        exit 1
+    }
+
+    {
+        printf '%s\n' \
+            '# GENERATED from deploy/envoy/envoy.yaml — DO NOT EDIT.' \
+            '# Regenerate with ./scripts/render-k8s-envoy.sh' \
+            '#' \
+            '# Rendered through `tpl`, so Helm expressions below are evaluated at' \
+            '# install time. The upstream clusters are appended by the template that' \
+            '# includes this file, from .Values.backends.'
+        sed -n "1,$((split_line - 1))p" "$SRC" | sed \
+            -e 's|address: sluiced, port_value: 8081|address: {{ include "sluice.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local, port_value: {{ .Values.service.authzPort }}|'
+    } > "$HELM_FILE"
+
+    grep -q 'include "sluice.fullname"' "$HELM_FILE" || {
+        echo "render-k8s-envoy: the Helm authz rewrite matched nothing" >&2
+        exit 1
+    }
+    grep -q 'address: sluiced' "$HELM_FILE" && {
+        echo "render-k8s-envoy: a Compose hostname survived into the Helm bootstrap" >&2
+        exit 1
+    }
+
+    echo "rendered $HELM_FILE"
+fi

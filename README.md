@@ -333,8 +333,25 @@ Manifests, applied in dependency order by filename:
 Or with Helm:
 
 ```bash
-helm install sluice deploy/helm/sluice --set api.token="$(make -s token)"
+TRUST_DOMAIN=cluster.local ./scripts/gen-certs.sh certs
+kubectl create secret generic sluice-certs \
+  --from-file=ca.crt=certs/ca.crt \
+  --from-file=server.crt=certs/server.crt \
+  --from-file=server.key=certs/server.key
+
+helm install sluice deploy/helm/sluice \
+  --set api.token="$(make -s token)" \
+  --set dataPlane.tls.existingSecret=sluice-certs
 ```
+
+The chart installs the data plane too, with its Envoy clusters generated from
+`backends` in values — add a region there and it gets a cluster, rather than a
+route to somewhere Envoy cannot reach. `--set dataPlane.enabled=false` installs
+the control plane alone, for a mesh that already has its own proxy. The chart
+refuses to render without an API token or, with the data plane on, without
+certificates; CI puts the bootstrap it *would* install through Envoy, because
+rendering is not loading.
+
 
 Nothing sensitive is committed. `make k8s-certs` generates the API token and a
 SPIFFE CA into Secrets, issuing under trust domain **`cluster.local`** — the

@@ -1,0 +1,186 @@
+{{- if .Values.dataPlane.enabled -}}
+{{/*
+The Envoy data plane.
+
+Without this the chart installs a control plane that answers authorisation
+questions nobody asks: Sluice decides, Envoy is what carries the packets. The
+raw manifests in deploy/k8s shipped without it once, and the result looked
+entirely healthy — pods Ready, backends probed, decision count zero forever.
+
+The bootstrap comes from files/envoy-bootstrap.yaml, which is generated from
+deploy/envoy/envoy.yaml so Compose, the raw manifests and this chart cannot
+drift apart. The upstream clusters are built here from .Values.backends, so
+adding a region to values gives it an Envoy cluster rather than a route to a
+cluster that does not exist.
+*/}}
+{{- $fullName := include "sluice.fullname" . -}}
+{{- $envoyName := printf "%s-envoy" $fullName -}}
+{{- $bootstrap := tpl (.Files.Get "files/envoy-bootstrap.yaml") . -}}
+{{- $clusters := list -}}
+{{- range .Values.backends }}
+{{- if .enabled }}
+{{- /* http://host:port -> host, port. The cluster name must equal the backend
+       id, because that is what Sluice returns in x-sluice-backend and what
+       Envoy's cluster_header then resolves. */ -}}
+{{- $hostPort := (urlParse .address).host -}}
+{{- $parts := splitn ":" 2 $hostPort -}}
+{{- $clusters = append $clusters (dict "id" .id "host" $parts._0 "port" (default "80" $parts._1)) -}}
+{{- end }}
+{{- end }}
+{{- if not $clusters }}
+{{- fail "dataPlane.enabled is true but no backend is enabled; Envoy would have nowhere to route" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $envoyName }}
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: data-plane
+data:
+  envoy.yaml: |
+{{ $bootstrap | indent 4 }}
+        # Upstream regions, generated from .Values.backends.
+        #
+        # Written out per cluster rather than with a YAML anchor and merge key:
+        # Envoy parses YAML into protobuf strictly, does not implement the YAML 1.1
+        # `<<` merge key, and rejects the *entire* bootstrap when it sees one — which
+        # takes the data plane with it.
+        #
+        # Outlier detection is conservative on purpose. Sluice's own circuit
+        # breakers already eject failing backends from the distribution, and two
+        # ejection mechanisms racing each other produce traffic patterns nobody can
+        # explain afterwards. Envoy's job here is only to catch a host failing
+        # faster than the control loop's one-second cadence.
+        {{- range $clusters }}
+        - name: {{ .id }}
+          type: STRICT_DNS
+          connect_timeout: 2s
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: {{ .id }}
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address: { address: {{ .host }}, port_value: {{ .port }} }
+          outlier_detection:
+            consecutive_5xx: 8
+            interval: 10s
+            base_ejection_time: 15s
+            max_ejection_percent: 50
+        {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $envoyName }}
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: data-plane
+spec:
+  replicas: {{ .Values.dataPlane.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "sluice.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: data-plane
+  template:
+    metadata:
+      labels:
+        {{- include "sluice.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: data-plane
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.dataPlane.adminPort | quote }}
+        prometheus.io/path: /stats/prometheus
+        # A projected ConfigMap update does not restart Envoy, so without this
+        # a bootstrap change leaves every replica on the previous config.
+        checksum/config: {{ $bootstrap | sha256sum | trunc 16 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: envoy
+          image: "{{ .Values.dataPlane.image.repository }}:{{ .Values.dataPlane.image.tag }}"
+          imagePullPolicy: {{ .Values.dataPlane.image.pullPolicy }}
+          args:
+            - --config-path
+            - /etc/envoy/envoy.yaml
+            - --log-level
+            - {{ .Values.dataPlane.logLevel }}
+          ports:
+            - name: https
+              containerPort: {{ .Values.dataPlane.listenPort }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ .Values.dataPlane.adminPort }}
+              protocol: TCP
+          # /ready goes green only once the listeners are actually serving,
+          # which is the property this is meant to assert.
+          readinessProbe:
+            httpGet: { path: /ready, port: admin }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /ready, port: admin }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.dataPlane.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: config, mountPath: /etc/envoy,        readOnly: true }
+            - { name: certs,  mountPath: /etc/sluice/certs, readOnly: true }
+            - { name: tmp,    mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $envoyName }}
+        - name: certs
+          secret:
+            secretName: {{ required "dataPlane.tls.existingSecret is required: Envoy terminates mutual TLS and needs a server certificate and a client CA. Generate one with scripts/gen-certs.sh (TRUST_DOMAIN=cluster.local, to match the shipped policy)." .Values.dataPlane.tls.existingSecret }}
+            # Envoy runs as uid 101 and cannot read a 0600 key.
+            defaultMode: 0444
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $envoyName }}
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: data-plane
+spec:
+  type: {{ .Values.dataPlane.service.type }}
+  selector:
+    {{- include "sluice.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: data-plane
+  ports:
+    - name: https
+      port: {{ .Values.dataPlane.listenPort }}
+      targetPort: https
+      protocol: TCP
+    - name: admin
+      port: {{ .Values.dataPlane.adminPort }}
+      targetPort: admin
+      protocol: TCP
+{{- end }}

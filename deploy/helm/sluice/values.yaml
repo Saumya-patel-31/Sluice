@@ -38,6 +38,46 @@ api:
   # out rather than reached by forgetting the secret.
   allowAnonymousMutations: false
 
+# ── Data plane ───────────────────────────────────────────────────────────────
+#
+# Envoy: the thing that actually carries the packets. Sluice decides where a
+# request should go; without a data plane asking, it decides nothing and looks
+# perfectly healthy doing it.
+#
+# Its bootstrap is generated from deploy/envoy/envoy.yaml into
+# files/envoy-bootstrap.yaml, so this chart, the raw manifests and the Compose
+# stack cannot drift apart. The upstream clusters come from `backends` below.
+dataPlane:
+  enabled: true
+  replicaCount: 2
+  listenPort: 10000
+  adminPort: 9901
+  logLevel: warn
+  image:
+    repository: envoyproxy/envoy
+    tag: v1.32-latest
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+  # Envoy terminates mutual TLS, so it needs a server certificate and the CA it
+  # should verify clients against — ca.crt, server.crt and server.key in one
+  # Secret. Generate a demo set with:
+  #
+  #   TRUST_DOMAIN=cluster.local ./scripts/gen-certs.sh certs
+  #   kubectl create secret generic sluice-certs   #     --from-file=ca.crt=certs/ca.crt   #     --from-file=server.crt=certs/server.crt   #     --from-file=server.key=certs/server.key
+  #
+  # cluster.local matters: it is the trust domain the shipped policy
+  # recognises. Certificates issued under any other domain install cleanly,
+  # report every pod healthy, and are then refused on every request.
+  tls:
+    existingSecret: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 96Mi
+    limits:
+      memory: 512Mi
+
 # Sluice reads no Kubernetes API objects, so its service account needs no
 # permissions and no mounted token.
 serviceAccount:

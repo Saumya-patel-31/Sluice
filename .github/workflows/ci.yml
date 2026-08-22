@@ -171,10 +171,13 @@ jobs:
 
       - name: Lint and render
         run: |
-          helm lint deploy/helm/sluice --set api.token=lint-only
-          helm template sluice deploy/helm/sluice --set api.token=lint-only > /dev/null
-          helm template sluice deploy/helm/sluice --set api.token=lint-only \
+          COMMON="--set api.token=lint-only --set dataPlane.tls.existingSecret=lint-only"
+          helm lint deploy/helm/sluice $COMMON
+          helm template sluice deploy/helm/sluice $COMMON > /dev/null
+          helm template sluice deploy/helm/sluice $COMMON \
             --set serviceMonitor.enabled=true > /dev/null
+          helm template sluice deploy/helm/sluice --set api.token=lint-only \
+            --set dataPlane.enabled=false > /dev/null
 
       # The chart must refuse to render an unauthenticated write API, the same
       # way the binary refuses to start with one.
@@ -185,6 +188,54 @@ jobs:
             exit 1
           fi
           echo "chart correctly refuses to render without a token"
+
+      # Envoy terminates mutual TLS. Rendering a data plane with no server
+      # certificate would produce pods that cannot start, discovered at rollout
+      # rather than at template time.
+      - name: The chart rejects a data plane with no TLS secret
+        run: |
+          if helm template sluice deploy/helm/sluice \
+               --set api.token=lint-only >/dev/null 2>&1; then
+            echo "chart rendered a data plane without TLS material"
+            exit 1
+          fi
+          echo "chart correctly refuses to render a data plane without certificates"
+
+      # Rendering is not loading. The chart builds its Envoy bootstrap from a
+      # generated prelude plus clusters derived from .Values.backends, and a
+      # bootstrap that fails to load takes the whole data plane with it — so the
+      # config the chart would actually install is put through Envoy itself.
+      - name: The chart's Envoy bootstrap loads
+        run: |
+          helm template sluice deploy/helm/sluice \
+            --set api.token=lint-only \
+            --set dataPlane.tls.existingSecret=sluice-certs > /tmp/rendered.yaml
+          python3 - <<'PY'
+          import yaml
+          docs = [d for d in yaml.safe_load_all(open("/tmp/rendered.yaml")) if d]
+          cm = next(d for d in docs if d["kind"] == "ConfigMap"
+                    and d["metadata"]["name"].endswith("-envoy"))
+          boot = cm["data"]["envoy.yaml"]
+          open("/tmp/envoy-from-chart.yaml", "w").write(boot)
+          names = [c["name"] for c in yaml.safe_load(boot)["static_resources"]["clusters"]]
+          print("clusters:", ", ".join(names))
+          # One authz cluster plus one per enabled backend. A cluster missing
+          # here is a backend Sluice can choose and Envoy cannot reach.
+          assert len(names) == 4, f"expected 4 clusters, got {names}"
+          PY
+
+          mkdir -p /tmp/certs
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout /tmp/certs/server.key -out /tmp/certs/server.crt \
+            -subj "/CN=validate" 2>/dev/null
+          cp /tmp/certs/server.crt /tmp/certs/ca.crt
+          chmod 644 /tmp/certs/*
+
+          docker run --rm \
+            -v "/tmp/envoy-from-chart.yaml:/etc/envoy/envoy.yaml:ro" \
+            -v "/tmp/certs:/etc/sluice/certs:ro" \
+            envoyproxy/envoy:v1.32-latest \
+            --mode validate -c /etc/envoy/envoy.yaml
 
   envoy:
     name: envoy config

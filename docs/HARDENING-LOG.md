@@ -188,6 +188,57 @@ checks all three.
 CI is now eight jobs: `test`, `build`, `policy`, `image`, `chart`, `envoy`,
 `end-to-end stack`, `kubernetes`.
 
+### SLU-308 · The Helm chart had the same missing data plane
+
+**Severity: high.** Fixing `deploy/k8s/` (SLU-301) left the chart shipping
+exactly the defect that had just been removed from the raw manifests:
+`helm install` produced a control plane with nothing asking it questions, and
+the README offered it as an equal alternative.
+
+**Fixed:** `deploy/helm/sluice/templates/envoy.yaml`, gated on
+`dataPlane.enabled` (default true). Its bootstrap prelude is generated from
+`deploy/envoy/envoy.yaml` by the same renderer, and the **upstream clusters are
+built from `.Values.backends`** — so adding a region to values gives it an Envoy
+cluster, rather than a backend Sluice can choose and Envoy cannot reach. The
+cluster name is the backend id, because that is what `x-sluice-backend` carries
+and what `cluster_header` resolves.
+
+The chart now `fail`s at template time on a data plane with no enabled backend,
+and `required`s a TLS secret with a message naming `TRUST_DOMAIN=cluster.local`
+— the mistake in SLU-302, stated where somebody is about to make it.
+
+**Verified:** the chart's own bootstrap, extracted from the rendered ConfigMap,
+loads in Envoy 1.32 — *four clusters, one listener, `configuration OK`*, with
+the endpoints resolved from values:
+
+```
+sluice_authz         -> sluice.default.svc.cluster.local:8081
+aws-us-east-1        -> checkout.aws-us-east-1.svc.cluster.local:8080
+gcp-us-central1      -> checkout.gcp-us-central1.svc.cluster.local:8080
+azure-francecentral  -> checkout.azure-francecentral.svc.cluster.local:8080
+```
+
+The `chart` job in CI now does that on every push, plus asserts the cluster
+count and that the chart refuses both a missing API token and a data plane with
+no certificates. Linting proves a chart renders; only Envoy proves it runs.
+
+### SLU-309 · Every script was committed non-executable
+
+**Severity: moderate, and it masqueraded as two unrelated failures.** Git for
+Windows cannot detect the executable bit, so every script authored there is
+committed `100644`. On the Linux runners, `./scripts/render-k8s-envoy.sh` and
+`./scripts/gen-certs.sh` were *Permission denied*.
+
+What CI reported was "the Kubernetes render is stale" and a `Deploy` step that
+could not create the mTLS Secret — two plausible, entirely wrong diagnoses. The
+render was byte-identical; reproducing it in an `ubuntu:24.04` container proved
+that before any time went into chasing line endings or hash determinism.
+
+**Fixed:** `git update-index --chmod=+x` on all three, and a check in the `test`
+job that fails on any `*.sh` staged at anything but `100755`. The next script
+added from a Windows checkout would land the same way, and point at the wrong
+thing again.
+
 ### Also in this pass
 
 - Three regional namespaces (`deploy/k8s/10-regions.yaml`) with `checkout`
